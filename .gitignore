@@ -1,1 +1,3 @@
+/.tests/
+/Cargo.lock
 /target

@@ -133,6 +133,9 @@ impl<D: Clone + Debug + Default + for<'a> serde::Deserialize<'a> + serde::Serial
         while root.context_file(next_context).exists() {
             next_context += 1;
         }
+        if next_context == 0 {
+            next_context += 1;
+        }
         // next_context points to the first uninitialized context
         let curr_context = next_context.saturating_sub(1);
         let current = Context::default();
@@ -256,7 +259,7 @@ impl<D: Clone + Debug + Default + for<'a> serde::Deserialize<'a> + serde::Serial
     /// function.
     pub fn compact<O: Iterator<Item = Transaction<D>>>(
         &mut self,
-        doit: impl FnOnce(&dyn Iterator<Item = Transaction<D>>) -> O,
+        doit: impl FnOnce(&mut dyn Iterator<Item = Transaction<D>>) -> O,
     ) -> Result<(), claudius::Error> {
         // NOTE(rescrv): used as a lock.
         let _current = Self::lock(self.root.context_file(self.curr_context))?;
@@ -270,7 +273,7 @@ impl<D: Clone + Debug + Default + for<'a> serde::Deserialize<'a> + serde::Serial
             .mode(0o600)
             .open(self.root.context_file(self.next_context))?;
         let mut buffer = String::new();
-        for xact in doit(&self.current.transactions()) {
+        for xact in doit(&mut self.current.transactions()) {
             let json = serde_json::to_string(&xact).map_err(|err| {
                 claudius::Error::serialization(
                     "could not serialize transaction",
@@ -374,4 +377,405 @@ impl<D: Clone + Debug + Default + for<'a> serde::Deserialize<'a> + serde::Serial
 /////////////////////////////////////////////// tests //////////////////////////////////////////////
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transaction_id_generation() {
+        let id1 = TransactionID::generate().unwrap();
+        let id2 = TransactionID::generate().unwrap();
+
+        // IDs should be unique
+        assert_ne!(id1, id2);
+
+        // Should have correct prefix
+        let s1 = id1.to_string();
+        assert!(s1.starts_with("tx:"));
+
+        // Should be parseable
+        let parsed = TransactionID::from_human_readable(&s1).unwrap();
+        assert_eq!(id1, parsed);
+    }
+
+    #[test]
+    fn mount_id_generation() {
+        let id1 = MountID::generate().unwrap();
+        let id2 = MountID::generate().unwrap();
+
+        // IDs should be unique
+        assert_ne!(id1, id2);
+
+        // Should have correct prefix
+        let s1 = id1.to_string();
+        assert!(s1.starts_with("mount:"));
+
+        // Should be parseable
+        let parsed = MountID::from_human_readable(&s1).unwrap();
+        assert_eq!(id1, parsed);
+    }
+
+    #[test]
+    fn id_serialization() {
+        let txid = TransactionID::generate().unwrap();
+        let json = serde_json::to_string(&txid).unwrap();
+        let deserialized: TransactionID = serde_json::from_str(&json).unwrap();
+        assert_eq!(txid, deserialized);
+
+        let mount_id = MountID::generate().unwrap();
+        let json = serde_json::to_string(&mount_id).unwrap();
+        let deserialized: MountID = serde_json::from_str(&json).unwrap();
+        assert_eq!(mount_id, deserialized);
+    }
+
+    #[test]
+    fn invalid_id_parsing() {
+        assert!(TransactionID::from_human_readable("invalid").is_none());
+        assert!(TransactionID::from_human_readable("mount:123").is_none());
+        assert!(MountID::from_human_readable("tx:123").is_none());
+    }
+
+    #[test]
+    fn transaction_creation() {
+        #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq)]
+        struct TestData {
+            value: String,
+        }
+
+        let tx = Transaction {
+            txid: TransactionID::generate().unwrap(),
+            data: TestData {
+                value: "test".to_string(),
+            },
+            msgs: vec![],
+            writes: vec![],
+        };
+
+        assert_eq!(tx.data.value, "test");
+        assert_eq!(tx.messages().count(), 0);
+    }
+
+    #[test]
+    fn transaction_messages_iterator() {
+        use claudius::{MessageParam, MessageRole};
+
+        #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+        struct TestData;
+
+        let msg1 = MessageParam {
+            role: MessageRole::User,
+            content: "Hello".to_string().into(),
+        };
+        let msg2 = MessageParam {
+            role: MessageRole::Assistant,
+            content: "Hi there".to_string().into(),
+        };
+
+        let tx = Transaction {
+            txid: TransactionID::generate().unwrap(),
+            data: TestData,
+            msgs: vec![msg1.clone(), msg2.clone()],
+            writes: vec![],
+        };
+
+        let messages: Vec<_> = tx.messages().collect();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, msg1.content);
+        assert_eq!(messages[1].content, msg2.content);
+
+        // Test reverse iteration
+        let rev_messages: Vec<_> = tx.messages().rev().collect();
+        assert_eq!(rev_messages.len(), 2);
+        assert_eq!(rev_messages[0].content, msg2.content);
+        assert_eq!(rev_messages[1].content, msg1.content);
+    }
+
+    #[test]
+    fn file_write() {
+        let fw = FileWrite {
+            mount: MountID::generate().unwrap(),
+            path: "/test/file.txt".to_string(),
+            data: "content".to_string(),
+        };
+
+        let json = serde_json::to_string(&fw).unwrap();
+        let deserialized: FileWrite = serde_json::from_str(&json).unwrap();
+        assert_eq!(fw.path, deserialized.path);
+        assert_eq!(fw.data, deserialized.data);
+    }
+
+    #[test]
+    fn context_from_transactions() {
+        #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+        struct TestData;
+
+        let tx1 = Transaction {
+            txid: TransactionID::generate().unwrap(),
+            data: TestData,
+            msgs: vec![],
+            writes: vec![],
+        };
+        let tx2 = Transaction {
+            txid: TransactionID::generate().unwrap(),
+            data: TestData,
+            msgs: vec![],
+            writes: vec![],
+        };
+
+        let context = Context::from(vec![tx1.clone(), tx2.clone()]);
+        let transactions: Vec<_> = context.transactions().collect();
+        assert_eq!(transactions.len(), 2);
+        assert_eq!(transactions[0].txid, tx1.txid);
+        assert_eq!(transactions[1].txid, tx2.txid);
+    }
+
+    #[test]
+    fn context_messages_flattening() {
+        use claudius::{MessageParam, MessageRole};
+
+        #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+        struct TestData;
+
+        let msg1 = MessageParam {
+            role: MessageRole::User,
+            content: "Message 1".to_string().into(),
+        };
+        let msg2 = MessageParam {
+            role: MessageRole::Assistant,
+            content: "Message 2".to_string().into(),
+        };
+        let msg3 = MessageParam {
+            role: MessageRole::User,
+            content: "Message 3".to_string().into(),
+        };
+
+        let tx1 = Transaction {
+            txid: TransactionID::generate().unwrap(),
+            data: TestData,
+            msgs: vec![msg1.clone(), msg2.clone()],
+            writes: vec![],
+        };
+        let tx2 = Transaction {
+            txid: TransactionID::generate().unwrap(),
+            data: TestData,
+            msgs: vec![msg3.clone()],
+            writes: vec![],
+        };
+
+        let context = Context::from(vec![tx1, tx2]);
+        let messages: Vec<_> = context.messages().collect();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, msg1.content);
+        assert_eq!(messages[1].content, msg2.content);
+        assert_eq!(messages[2].content, msg3.content);
+    }
+
+    #[test]
+    fn path_ext_context_file() {
+        let root = Path::new("/test/root");
+        assert_eq!(root.context_file(0).as_str(), "/test/root/contexts/0.jsonl");
+        assert_eq!(
+            root.context_file(42).as_str(),
+            "/test/root/contexts/42.jsonl"
+        );
+    }
+
+    #[test]
+    fn context_manager_new_empty_dir() {
+        #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+        struct TestData;
+
+        let root = Path::from(".tests").join("context_manager_new_empty_dir");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let manager = ContextManager::<TestData>::new(root).unwrap();
+        assert!(manager.contexts().unwrap().count() == 1);
+    }
+
+    #[test]
+    fn context_manager_transact() {
+        use claudius::{MessageParam, MessageParamContent, MessageRole};
+
+        #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq)]
+        struct TestData {
+            counter: u32,
+        }
+
+        let root = Path::from(".tests").join("context_manager_transact");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Create contexts directory
+        std::fs::create_dir_all(root.join("contexts")).unwrap();
+
+        let mut manager = ContextManager::<TestData>::new(root).unwrap();
+
+        // Perform a transaction
+        manager
+            .transact::<claudius::Error>(|_context| {
+                let msg = MessageParam {
+                    role: MessageRole::User,
+                    content: "Test message".to_string().into(),
+                };
+                Ok(Transaction {
+                    txid: TransactionID::generate().unwrap(),
+                    data: TestData { counter: 1 },
+                    msgs: vec![msg],
+                    writes: vec![],
+                })
+            })
+            .unwrap();
+
+        // Verify the transaction was persisted
+        let messages: Vec<_> = manager.messages().unwrap().collect();
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            Ok(msg) => {
+                if let MessageParamContent::String(text) = &msg.content {
+                    assert_eq!(text, "Test message");
+                } else {
+                    panic!("Expected string content");
+                }
+            }
+            Err(_) => panic!("Expected Ok message"),
+        }
+    }
+
+    #[test]
+    fn context_manager_persistence() {
+        #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq)]
+        struct TestData {
+            value: String,
+        }
+
+        let root = Path::from(".tests").join("context_manager_persistence");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Create contexts directory
+        std::fs::create_dir_all(root.join("contexts")).unwrap();
+
+        // Create first manager and add transaction
+        {
+            let mut manager = ContextManager::<TestData>::new(root.clone()).unwrap();
+            manager
+                .transact::<claudius::Error>(|_| {
+                    Ok(Transaction {
+                        txid: TransactionID::generate().unwrap(),
+                        data: TestData {
+                            value: "persisted".to_string(),
+                        },
+                        msgs: vec![],
+                        writes: vec![],
+                    })
+                })
+                .unwrap();
+        }
+
+        // Create second manager and verify data is loaded
+        {
+            let manager = ContextManager::<TestData>::new(root).unwrap();
+            let transactions: Vec<_> = manager
+                .transactions()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(transactions.len(), 1);
+            assert_eq!(transactions[0].data.value, "persisted");
+        }
+    }
+
+    #[test]
+    fn integration_workflow() {
+        use claudius::{MessageParam, MessageRole};
+
+        #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq)]
+        struct AppState {
+            step: u32,
+            description: String,
+        }
+
+        let root = Path::from(".tests").join("integration_workflow");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("contexts")).unwrap();
+
+        let mut manager = ContextManager::<AppState>::new(root).unwrap();
+
+        // Step 1: Initial transaction
+        manager
+            .transact::<claudius::Error>(|_| {
+                let msg = MessageParam {
+                    role: MessageRole::User,
+                    content: "Initialize system".to_string().into(),
+                };
+                Ok(Transaction {
+                    txid: TransactionID::generate().unwrap(),
+                    data: AppState {
+                        step: 1,
+                        description: "Initialized".to_string(),
+                    },
+                    msgs: vec![msg],
+                    writes: vec![FileWrite {
+                        mount: MountID::generate().unwrap(),
+                        path: "/state.txt".to_string(),
+                        data: "step=1".to_string(),
+                    }],
+                })
+            })
+            .unwrap();
+
+        // Step 2: Another transaction
+        manager
+            .transact::<claudius::Error>(|_| {
+                let msg = MessageParam {
+                    role: MessageRole::Assistant,
+                    content: "System initialized".to_string().into(),
+                };
+                Ok(Transaction {
+                    txid: TransactionID::generate().unwrap(),
+                    data: AppState {
+                        step: 2,
+                        description: "Running".to_string(),
+                    },
+                    msgs: vec![msg],
+                    writes: vec![],
+                })
+            })
+            .unwrap();
+
+        // Verify all messages
+        let messages: Vec<_> = manager
+            .messages()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+
+        // Verify transactions
+        let transactions: Vec<_> = manager
+            .transactions()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(transactions.len(), 2);
+        assert_eq!(transactions[0].data.step, 1);
+        assert_eq!(transactions[1].data.step, 2);
+
+        // Test compaction
+        manager
+            .compact(|iter| {
+                // Keep only the last transaction
+                let mut last_tx = None;
+                for tx in iter {
+                    last_tx = Some(tx);
+                }
+                last_tx.into_iter()
+            })
+            .unwrap();
+
+        // After compaction, we should have a new context with just one transaction
+        let contexts_count = manager.contexts().unwrap().count();
+        assert_eq!(contexts_count, 2); // Original + compacted
+    }
+}
