@@ -234,16 +234,19 @@ impl<D: Clone + Debug + Default + for<'a> serde::Deserialize<'a> + serde::Serial
     }
 
     // Transact on the latest context.  This will acquire a lock on the context across all
-    // processes, and then synchronously execute the transaction against the context.
-    pub fn transact<E: From<claudius::Error>>(
+    // processes, and then asynchronously execute the transaction against the context.
+    pub async fn transact<E: From<claudius::Error>, F>(
         &mut self,
-        transact: impl FnOnce(&Context<D>) -> Result<Transaction<D>, E>,
-    ) -> Result<(), E> {
+        transact: impl FnOnce(&Context<D>) -> F,
+    ) -> Result<(), E>
+    where
+        F: std::future::Future<Output = Result<Transaction<D>, E>>,
+    {
         let mut output = Self::lock(self.root.context_file(self.curr_context))?;
         if self.root.context_file(self.next_context).exists() {
             todo!();
         }
-        let xact = transact(&self.current)?;
+        let xact = transact(&self.current).await?;
         let mut json = serde_json::to_string(&xact).map_err(|err| {
             claudius::Error::serialization("could not serialize transaction", Some(Box::new(err)))
         })?;
@@ -592,8 +595,8 @@ mod tests {
         assert!(manager.contexts().unwrap().count() == 1);
     }
 
-    #[test]
-    fn context_manager_transact() {
+    #[tokio::test]
+    async fn context_manager_transact() {
         use claudius::{MessageParam, MessageParamContent, MessageRole};
 
         #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq)]
@@ -612,7 +615,7 @@ mod tests {
 
         // Perform a transaction
         manager
-            .transact::<claudius::Error>(|_context| {
+            .transact::<claudius::Error, _>(|_context| async move {
                 let msg = MessageParam {
                     role: MessageRole::User,
                     content: "Test message".to_string().into(),
@@ -624,6 +627,7 @@ mod tests {
                     writes: vec![],
                 })
             })
+            .await
             .unwrap();
 
         // Verify the transaction was persisted
@@ -641,8 +645,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn context_manager_persistence() {
+    #[tokio::test]
+    async fn context_manager_persistence() {
         #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq)]
         struct TestData {
             value: String,
@@ -659,7 +663,7 @@ mod tests {
         {
             let mut manager = ContextManager::<TestData>::new(root.clone()).unwrap();
             manager
-                .transact::<claudius::Error>(|_| {
+                .transact::<claudius::Error, _>(|_| async move {
                     Ok(Transaction {
                         txid: TransactionID::generate().unwrap(),
                         data: TestData {
@@ -669,6 +673,7 @@ mod tests {
                         writes: vec![],
                     })
                 })
+                .await
                 .unwrap();
         }
 
@@ -685,8 +690,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn integration_workflow() {
+    #[tokio::test]
+    async fn integration_workflow() {
         use claudius::{MessageParam, MessageRole};
 
         #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq)]
@@ -704,7 +709,7 @@ mod tests {
 
         // Step 1: Initial transaction
         manager
-            .transact::<claudius::Error>(|_| {
+            .transact::<claudius::Error, _>(|_| async move {
                 let msg = MessageParam {
                     role: MessageRole::User,
                     content: "Initialize system".to_string().into(),
@@ -723,11 +728,12 @@ mod tests {
                     }],
                 })
             })
+            .await
             .unwrap();
 
         // Step 2: Another transaction
         manager
-            .transact::<claudius::Error>(|_| {
+            .transact::<claudius::Error, _>(|_| async move {
                 let msg = MessageParam {
                     role: MessageRole::Assistant,
                     content: "System initialized".to_string().into(),
@@ -742,6 +748,7 @@ mod tests {
                     writes: vec![],
                 })
             })
+            .await
             .unwrap();
 
         // Verify all messages
