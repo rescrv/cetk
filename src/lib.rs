@@ -235,12 +235,12 @@ impl<D: Clone + Debug + Default + for<'a> serde::Deserialize<'a> + serde::Serial
 
     // Transact on the latest context.  This will acquire a lock on the context across all
     // processes, and then asynchronously execute the transaction against the context.
-    pub async fn transact<E: From<claudius::Error>, F>(
-        &mut self,
+    pub async fn transact<'a, E: From<claudius::Error>, F>(
+        &'a mut self,
         transact: impl FnOnce(&Context<D>) -> F,
     ) -> Result<(), E>
     where
-        F: std::future::Future<Output = Result<Transaction<D>, E>>,
+        F: std::future::Future<Output = Result<Transaction<D>, E>> + 'a,
     {
         let mut output = Self::lock(self.root.context_file(self.curr_context))?;
         if self.root.context_file(self.next_context).exists() {
@@ -314,6 +314,7 @@ impl<D: Clone + Debug + Default + for<'a> serde::Deserialize<'a> + serde::Serial
     fn lock(path: Path) -> Result<File, claudius::Error> {
         let what = libc::F_SETLKW;
         // Open the file, creating it if it doesn't exist.
+        std::fs::create_dir_all(path.dirname())?;
         let file = OpenOptions::new()
             .read(true)
             .append(true)
