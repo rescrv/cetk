@@ -157,7 +157,7 @@ To that end, a Chroma collection is populated by the following objects, all scop
     - key: `mount=UUID;path=/path/to/file.md;section=section header/bullet`.
     - document:  A single < 16kB bullet.
     - embedding:  embed(document).
-- **locks**:  A lock file, one per agent.
+- **lock**:  A lock file, one per agent.
     - metadata: No additional metadata.
     - key: `LOCK`
     - document:  A textual description of the caller.
