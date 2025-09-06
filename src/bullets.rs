@@ -47,8 +47,23 @@ impl MarkdownList {
     pub fn from_markdown(mount_id: MountID, path: String, markdown: &str) -> Result<Self, Error> {
         let mut list = MarkdownList::new(mount_id, path);
         let mut current_section = String::new();
-        let mut current_bullet = String::new();
+        let mut current_bullet_lines: Vec<String> = Vec::new();
         let mut in_bullet = false;
+
+        // Helper closure to save the current bullet if it exists
+        let save_current_bullet = |list: &mut MarkdownList,
+                                   current_section: &str,
+                                   current_bullet_lines: &mut Vec<String>,
+                                   in_bullet: &mut bool| {
+            if *in_bullet && !current_bullet_lines.is_empty() {
+                let bullet = current_bullet_lines.join("\n").trim().to_string();
+                if !bullet.is_empty() {
+                    list.add_bullet(current_section.to_string(), bullet);
+                }
+                current_bullet_lines.clear();
+                *in_bullet = false;
+            }
+        };
 
         for line in markdown.lines() {
             let trimmed = line.trim();
@@ -58,43 +73,52 @@ impl MarkdownList {
                 let hash_count = trimmed.chars().take_while(|&c| c == '#').count();
                 if hash_count > 1 {
                     return Err(Error::InvalidSequence(format!(
-                        "Only single-level headers (#) are allowed, found {} levels",
-                        hash_count
+                        "Only single-level headers (#) are allowed, found {hash_count} levels"
                     )));
                 }
 
                 // Save current bullet if we have one (allow empty section for section-less bullets)
-                if in_bullet && !current_bullet.trim().is_empty() {
-                    list.add_bullet(current_section.clone(), current_bullet.trim().to_string());
-                    current_bullet.clear();
-                    in_bullet = false;
-                }
+                save_current_bullet(
+                    &mut list,
+                    &current_section,
+                    &mut current_bullet_lines,
+                    &mut in_bullet,
+                );
 
                 // New section header
-                current_section = trimmed[1..].trim().to_string();
-                list.create_section(current_section.clone());
-            } else if trimmed.starts_with('-') || trimmed.starts_with('*') {
-                // Save current bullet if we have one (allow empty section for section-less bullets)
-                if in_bullet && !current_bullet.trim().is_empty() {
-                    list.add_bullet(current_section.clone(), current_bullet.trim().to_string());
+                if let Some(header_text) = trimmed.strip_prefix('#') {
+                    current_section = header_text.trim().to_string();
                 }
+                list.create_section(current_section.clone());
+            } else if let Some(bullet_text) = trimmed
+                .strip_prefix('-')
+                .or_else(|| trimmed.strip_prefix('*'))
+            {
+                // Save current bullet if we have one (allow empty section for section-less bullets)
+                save_current_bullet(
+                    &mut list,
+                    &current_section,
+                    &mut current_bullet_lines,
+                    &mut in_bullet,
+                );
 
                 // Start new bullet point
-                current_bullet = trimmed[1..].trim().to_string();
+                current_bullet_lines.push(bullet_text.to_string());
                 in_bullet = true;
             } else if in_bullet {
                 // Continue current bullet point (multi-line)
-                if !current_bullet.is_empty() {
-                    current_bullet.push(' ');
-                }
-                current_bullet.push_str(trimmed);
+                // Preserve the original line (including indentation)
+                current_bullet_lines.push(line.to_string());
             }
         }
 
         // Save the last bullet if we have one (allow empty section for section-less bullets)
-        if in_bullet && !current_bullet.trim().is_empty() {
-            list.add_bullet(current_section.clone(), current_bullet.trim().to_string());
-        }
+        save_current_bullet(
+            &mut list,
+            &current_section,
+            &mut current_bullet_lines,
+            &mut in_bullet,
+        );
 
         Ok(list)
     }
@@ -165,15 +189,64 @@ mod tests {
         assert_eq!(list.sections.get("Tasks").unwrap().len(), 3);
         assert_eq!(
             list.sections.get("Tasks").unwrap()[0],
-            "First task that spans multiple lines"
+            "First task that\n  spans multiple\n  lines"
         );
         assert_eq!(
             list.sections.get("Tasks").unwrap()[1],
-            "Second task also multi-line"
+            "Second task\n  also multi-line"
         );
         assert_eq!(
             list.sections.get("Tasks").unwrap()[2],
-            "Third task is a single liner continued"
+            "Third task is\n  a single liner continued"
+        );
+    }
+
+    #[test]
+    fn parse_multi_line_bullets_with_blank_lines() {
+        // Test based on EXAMPLE.md format
+        let markdown = r#"- This is a bullet in the "" section.
+
+# Section 1
+
+- This is another bullet.
+- This is a multi-line bullet
+
+It continues down here.
+
+# Section 2
+
+- Did you catch that?"#;
+
+        let list = MarkdownList::from_markdown(
+            MountID::generate().unwrap(),
+            "test.md".to_string(),
+            markdown,
+        )
+        .expect("Should parse successfully");
+
+        // Check section-less bullet
+        assert_eq!(list.sections.get("").unwrap().len(), 1);
+        assert_eq!(
+            list.sections.get("").unwrap()[0],
+            "This is a bullet in the \"\" section."
+        );
+
+        // Check Section 1 bullets
+        assert_eq!(list.sections.get("Section 1").unwrap().len(), 2);
+        assert_eq!(
+            list.sections.get("Section 1").unwrap()[0],
+            "This is another bullet."
+        );
+        assert_eq!(
+            list.sections.get("Section 1").unwrap()[1],
+            "This is a multi-line bullet\n\nIt continues down here."
+        );
+
+        // Check Section 2
+        assert_eq!(list.sections.get("Section 2").unwrap().len(), 1);
+        assert_eq!(
+            list.sections.get("Section 2").unwrap()[0],
+            "Did you catch that?"
         );
     }
 
