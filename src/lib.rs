@@ -1,43 +1,37 @@
 #![doc = include_str!("../README.md")]
+//!
+//! ## Context Engineer's Toolkit (CETK)
+//!
+//! This crate provides core types and utilities for the Context Engineer's Toolkit:
+//!
+//! ```rust
+//! use cetk::{Transaction, AgentID};
+//!
+//! # fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Create a transaction
+//! let agent_id = AgentID::from_human_readable("agent:00000000-0000-0000-0000-000000000001").unwrap();
+//! let transaction = Transaction {
+//!     agent_id,
+//!     context_seq_no: 1,
+//!     transaction_seq_no: 42,
+//!     msgs: vec![],
+//!     writes: vec![],
+//! };
+//!
+//! println!("Transaction created for agent: {}", transaction.agent_id);
+//! # Ok(())
+//! # }
+//! ```
 
-use chromadb::ChromaClient;
-use claudius::{Anthropic, MessageParam};
 use one_two_eight::generate_id;
 
-mod bullets;
+mod transaction;
 
-pub use bullets::MarkdownList;
+pub use transaction::Transaction;
 
 ///////////////////////////////////////////// Constants ////////////////////////////////////////////
 
 const CHUNK_SIZE_LIMIT: usize = 8192;
-
-/////////////////////////////////////////////// Error //////////////////////////////////////////////
-
-#[derive(Debug)]
-pub enum Error {
-    ChromaConnectionError(String),
-    TransactionError(String),
-    ContextNotFound(String),
-    ChunkSizeExceeded(String),
-    InvalidSequence(String),
-    SealError(String),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::ChromaConnectionError(msg) => write!(f, "ChromaDB connection error: {msg}"),
-            Error::TransactionError(msg) => write!(f, "Transaction error: {msg}"),
-            Error::ContextNotFound(msg) => write!(f, "Context not found: {msg}"),
-            Error::ChunkSizeExceeded(msg) => write!(f, "Chunk size exceeded: {msg}"),
-            Error::InvalidSequence(msg) => write!(f, "Invalid sequence: {msg}"),
-            Error::SealError(msg) => write!(f, "Seal error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 ///////////////////////////////////////// generate_id_serde ////////////////////////////////////////
 
@@ -102,263 +96,415 @@ generate_id_serde!(MountID, MountIDVisitor);
 generate_id!(ContextID, "context:");
 generate_id_serde!(ContextID, ContextIDVisitor);
 
-//////////////////////////////////////////// Transaction ///////////////////////////////////////////
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// A Transaction contains a transaction ID, some application data (usually a pointer to the
-/// application state elsewhere, but it could be a state transition for rolling up in a state
-/// machine), some messages to append to the conversation, and some filesystem writes.
-#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
-pub struct Transaction {
-    pub agent_id: AgentID,
-    pub context_seq_no: u32,
-    pub transaction_seq_no: u64,
-    pub msgs: Vec<MessageParam>,
-    pub writes: Vec<FileWrite>,
-}
-
-impl Transaction {
-    /// Iterate over the messages of this transaction.
-    pub fn messages(&self) -> impl DoubleEndedIterator<Item = MessageParam> + '_ {
-        self.msgs.iter().cloned()
+    #[test]
+    fn chunk_size_limit_is_set_correctly() {
+        assert_eq!(CHUNK_SIZE_LIMIT, 8192);
     }
 
-    /// Generate an embedding summary for this transaction.
-    pub fn generate_embedding_summary(&self) -> String {
-        let msg_count = self.msgs.len();
-        let write_count = self.writes.len();
-        format!(
-            "Transaction {} for agent {} context {} with {} messages and {} file writes",
-            self.transaction_seq_no, self.agent_id, self.context_seq_no, msg_count, write_count
-        )
+    #[test]
+    fn agent_id_creates_from_human_readable() {
+        let id_str = "agent:00000000-0000-0000-0000-000000000001";
+        let agent_id = AgentID::from_human_readable(id_str);
+        assert!(agent_id.is_some());
+        assert_eq!(agent_id.unwrap().to_string(), id_str);
     }
 
-    /// Chunk a transaction if it exceeds the size limit.
-    pub fn chunk_transaction(&self) -> Result<Vec<TransactionChunk>, Error> {
-        let mut serialized = serde_json::to_string(self)
-            .map_err(|e| Error::TransactionError(format!("Failed to serialize: {e}")))?;
-
-        if serialized.len() <= CHUNK_SIZE_LIMIT {
-            return Ok(vec![TransactionChunk {
-                agent_id: self.agent_id,
-                context_seq_no: self.context_seq_no,
-                transaction_seq_no: self.transaction_seq_no,
-                chunk_seq_no: 0,
-                total_chunks: 1,
-                data: serialized,
-            }]);
-        }
-
-        let mut chunks = Vec::new();
-        let mut chunk_seq_no = 0;
-
-        while !serialized.is_empty() {
-            let chunk = serialized
-                .chars()
-                .take(CHUNK_SIZE_LIMIT)
-                .collect::<String>();
-            serialized = serialized
-                .chars()
-                .skip(CHUNK_SIZE_LIMIT)
-                .collect::<String>();
-            chunks.push(TransactionChunk {
-                agent_id: self.agent_id,
-                context_seq_no: self.context_seq_no,
-                transaction_seq_no: self.transaction_seq_no,
-                chunk_seq_no,
-                total_chunks: 0,
-                data: chunk,
-            });
-            chunk_seq_no += 1;
-        }
-
-        let total_chunks = chunks.len() as u32;
-        for chunk in &mut chunks {
-            chunk.total_chunks = total_chunks;
-        }
-
-        Ok(chunks)
+    #[test]
+    fn agent_id_rejects_invalid_prefix() {
+        let invalid_id = "invalid:00000000-0000-0000-0000-000000000001";
+        let agent_id = AgentID::from_human_readable(invalid_id);
+        assert!(agent_id.is_none());
     }
 
-    fn check_invariants(&self) -> Result<(), Error> {
-        for w in self.writes.iter() {
-            if w.data.len() >= CHUNK_SIZE_LIMIT {
-                return Err(Error::ChunkSizeExceeded(format!(
-                    "File write exceeds size limit: {} bytes",
-                    w.data.len()
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
-///////////////////////////////////////// TransactionChunk /////////////////////////////////////////
-
-/// A chunk of a transaction when it exceeds the storage size limit.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct TransactionChunk {
-    pub agent_id: AgentID,
-    pub context_seq_no: u32,
-    pub transaction_seq_no: u64,
-    pub chunk_seq_no: u32,
-    pub total_chunks: u32,
-    pub data: String,
-}
-
-///////////////////////////////////////////// FileWrite ////////////////////////////////////////////
-
-/// Write the complete contents of data to the file at path on mount.
-///
-/// We assume files in the virtual filesystem should be small.
-#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
-pub struct FileWrite {
-    pub mount: MountID,
-    pub path: String,
-    pub data: String,
-}
-
-////////////////////////////////////////////// Context /////////////////////////////////////////////
-
-/// An individual context.  Defined as a sequence of transactions, it can also be seen as a
-/// sequence of messages, or a projection of the filesystem (although we will not pursue this
-/// variant now as Context is data rather than code + data).
-pub struct Context<'a> {
-    manager: &'a ContextManager,
-    agent_id: AgentID,
-    context_seq_no: u32,
-    transactions: Vec<Transaction>,
-}
-
-impl Context<'_> {
-    /// Iterate over the transactions of this context.
-    pub fn transactions(&self) -> impl DoubleEndedIterator<Item = Transaction> {
-        self.transactions.iter().cloned()
+    #[test]
+    fn agent_id_rejects_malformed_uuid() {
+        let invalid_id = "agent:not-a-uuid";
+        let agent_id = AgentID::from_human_readable(invalid_id);
+        assert!(agent_id.is_none());
     }
 
-    /// Iterate over the messages of this context.
-    pub fn messages(&self) -> impl DoubleEndedIterator<Item = MessageParam> {
-        self.transactions.iter().flat_map(|tx| tx.messages())
+    #[test]
+    fn agent_id_generates_unique_ids() {
+        let id1 = AgentID::generate().unwrap();
+        let id2 = AgentID::generate().unwrap();
+        assert_ne!(id1, id2);
+        assert!(id1.to_string().starts_with("agent:"));
+        assert!(id2.to_string().starts_with("agent:"));
     }
 
-    // Insert the next transaction into durable storage.
-    pub async fn transact(&mut self, mut transaction: Transaction) -> Result<(), Error> {
-        self.check_invariants()?;
-        transaction.transaction_seq_no = self
-            .transactions
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidSequence("Transaction count overflow".to_string()))?
-            .try_into()
-            .map_err(|_| {
-                Error::InvalidSequence("Transaction sequence number overflow".to_string())
-            })?;
-        let res = self
-            .manager
-            .transact(self.agent_id, self.context_seq_no, transaction.clone())
-            .await;
-        if res.is_ok() {
-            self.transactions.push(transaction);
-            self.check_invariants()?;
-        }
-        res
+    #[test]
+    fn agent_id_roundtrip_string_conversion() {
+        let original = AgentID::generate().unwrap();
+        let string_repr = original.to_string();
+        let restored = AgentID::from_human_readable(&string_repr).unwrap();
+        assert_eq!(original, restored);
     }
 
-    // TODO(claude):  Make this function return an InvariantViolation enum and not assert.
-    fn check_invariants(&self) -> Result<(), Error> {
-        // Check each transaction individually
-        for (idx, tx) in self.transactions.iter().enumerate() {
-            // Verify transaction sequence number matches its position
-            if idx as u64 != tx.transaction_seq_no {
-                return Err(Error::InvalidSequence(format!(
-                    "Transaction at index {} has sequence number {}, expected {}",
-                    idx, tx.transaction_seq_no, idx
-                )));
-            }
-
-            // Verify agent_id matches the context's agent_id
-            if tx.agent_id != self.agent_id {
-                return Err(Error::InvalidSequence(format!(
-                    "Transaction {} has agent_id {}, expected {}",
-                    idx, tx.agent_id, self.agent_id
-                )));
-            }
-
-            // Verify context_seq_no matches the context's seq_no
-            if tx.context_seq_no != self.context_seq_no {
-                return Err(Error::InvalidSequence(format!(
-                    "Transaction {} has context_seq_no {}, expected {}",
-                    idx, tx.context_seq_no, self.context_seq_no
-                )));
-            }
-
-            // Check transaction's own invariants
-            tx.check_invariants()?;
-        }
-
-        // Check continuity between adjacent transactions
-        for (lhs, rhs) in self
-            .transactions
-            .iter()
-            .zip(self.transactions.iter().skip(1))
-        {
-            if lhs.transaction_seq_no.saturating_add(1) != rhs.transaction_seq_no {
-                return Err(Error::InvalidSequence(format!(
-                    "Non-continuous transaction sequence: {} -> {}",
-                    lhs.transaction_seq_no, rhs.transaction_seq_no
-                )));
-            }
-        }
-
-        Ok(())
+    #[test]
+    fn agent_id_serializes_to_json() {
+        let agent_id =
+            AgentID::from_human_readable("agent:12345678-1234-1234-1234-123456789012").unwrap();
+        let json = serde_json::to_string(&agent_id).unwrap();
+        assert_eq!(json, "\"agent:12345678-1234-1234-1234-123456789012\"");
     }
-}
 
-////////////////////////////////////////// ContextManager //////////////////////////////////////////
-
-pub struct ContextManager {
-    _claudius: Anthropic,
-    chroma: ChromaClient,
-    collection_name: String,
-}
-
-impl ContextManager {
-    pub async fn transact(
-        &self,
-        _agent_id: AgentID,
-        _context_seq_no: u32,
-        _transaction: Transaction,
-    ) -> Result<(), Error> {
-        todo!();
+    #[test]
+    fn agent_id_deserializes_from_json() {
+        let json = "\"agent:12345678-1234-1234-1234-123456789012\"";
+        let agent_id: AgentID = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            agent_id.to_string(),
+            "agent:12345678-1234-1234-1234-123456789012"
+        );
     }
-}
 
-//////////////////////////////////////////// ContextSeal ///////////////////////////////////////////
+    #[test]
+    fn agent_id_deserialization_rejects_invalid_format() {
+        let invalid_json = "\"invalid:12345678-1234-1234-1234-123456789012\"";
+        let result: Result<AgentID, _> = serde_json::from_str(invalid_json);
+        assert!(result.is_err());
+    }
 
-/// A seal marks the end of a context and points to the next context in the lineage.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct ContextSeal {
-    pub context_id: ContextID,
-    pub next_context_id: ContextID,
-    pub sealed_at_ms: u64,
-    pub summary: String,
-}
+    #[test]
+    fn agent_id_deserialization_rejects_malformed_uuid() {
+        let invalid_json = "\"agent:not-a-valid-uuid\"";
+        let result: Result<AgentID, _> = serde_json::from_str(invalid_json);
+        assert!(result.is_err());
+    }
 
-impl ContextSeal {
-    /// Create a new context seal.
-    pub fn new(context_id: ContextID, next_context_id: ContextID, summary: String) -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let sealed_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-            .try_into()
-            .unwrap();
+    #[test]
+    fn agent_id_serde_roundtrip() {
+        let original = AgentID::generate().unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: AgentID = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, restored);
+    }
 
-        ContextSeal {
-            context_id,
-            next_context_id,
-            sealed_at_ms,
-            summary,
-        }
+    #[test]
+    fn transaction_id_creates_from_human_readable() {
+        let id_str = "tx:00000000-0000-0000-0000-000000000001";
+        let tx_id = TransactionID::from_human_readable(id_str);
+        assert!(tx_id.is_some());
+        assert_eq!(tx_id.unwrap().to_string(), id_str);
+    }
+
+    #[test]
+    fn transaction_id_rejects_invalid_prefix() {
+        let invalid_id = "transaction:00000000-0000-0000-0000-000000000001";
+        let tx_id = TransactionID::from_human_readable(invalid_id);
+        assert!(tx_id.is_none());
+    }
+
+    #[test]
+    fn transaction_id_generates_unique_ids() {
+        let id1 = TransactionID::generate().unwrap();
+        let id2 = TransactionID::generate().unwrap();
+        assert_ne!(id1, id2);
+        assert!(id1.to_string().starts_with("tx:"));
+        assert!(id2.to_string().starts_with("tx:"));
+    }
+
+    #[test]
+    fn transaction_id_serializes_to_json() {
+        let tx_id =
+            TransactionID::from_human_readable("tx:12345678-1234-1234-1234-123456789012").unwrap();
+        let json = serde_json::to_string(&tx_id).unwrap();
+        assert_eq!(json, "\"tx:12345678-1234-1234-1234-123456789012\"");
+    }
+
+    #[test]
+    fn transaction_id_deserializes_from_json() {
+        let json = "\"tx:12345678-1234-1234-1234-123456789012\"";
+        let tx_id: TransactionID = serde_json::from_str(json).unwrap();
+        assert_eq!(tx_id.to_string(), "tx:12345678-1234-1234-1234-123456789012");
+    }
+
+    #[test]
+    fn transaction_id_serde_roundtrip() {
+        let original = TransactionID::generate().unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: TransactionID = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn mount_id_creates_from_human_readable() {
+        let id_str = "mount:00000000-0000-0000-0000-000000000001";
+        let mount_id = MountID::from_human_readable(id_str);
+        assert!(mount_id.is_some());
+        assert_eq!(mount_id.unwrap().to_string(), id_str);
+    }
+
+    #[test]
+    fn mount_id_rejects_invalid_prefix() {
+        let invalid_id = "filesystem:00000000-0000-0000-0000-000000000001";
+        let mount_id = MountID::from_human_readable(invalid_id);
+        assert!(mount_id.is_none());
+    }
+
+    #[test]
+    fn mount_id_generates_unique_ids() {
+        let id1 = MountID::generate().unwrap();
+        let id2 = MountID::generate().unwrap();
+        assert_ne!(id1, id2);
+        assert!(id1.to_string().starts_with("mount:"));
+        assert!(id2.to_string().starts_with("mount:"));
+    }
+
+    #[test]
+    fn mount_id_serializes_to_json() {
+        let mount_id =
+            MountID::from_human_readable("mount:12345678-1234-1234-1234-123456789012").unwrap();
+        let json = serde_json::to_string(&mount_id).unwrap();
+        assert_eq!(json, "\"mount:12345678-1234-1234-1234-123456789012\"");
+    }
+
+    #[test]
+    fn mount_id_deserializes_from_json() {
+        let json = "\"mount:12345678-1234-1234-1234-123456789012\"";
+        let mount_id: MountID = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            mount_id.to_string(),
+            "mount:12345678-1234-1234-1234-123456789012"
+        );
+    }
+
+    #[test]
+    fn mount_id_serde_roundtrip() {
+        let original = MountID::generate().unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: MountID = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn context_id_creates_from_human_readable() {
+        let id_str = "context:00000000-0000-0000-0000-000000000001";
+        let context_id = ContextID::from_human_readable(id_str);
+        assert!(context_id.is_some());
+        assert_eq!(context_id.unwrap().to_string(), id_str);
+    }
+
+    #[test]
+    fn context_id_rejects_invalid_prefix() {
+        let invalid_id = "ctx:00000000-0000-0000-0000-000000000001";
+        let context_id = ContextID::from_human_readable(invalid_id);
+        assert!(context_id.is_none());
+    }
+
+    #[test]
+    fn context_id_generates_unique_ids() {
+        let id1 = ContextID::generate().unwrap();
+        let id2 = ContextID::generate().unwrap();
+        assert_ne!(id1, id2);
+        assert!(id1.to_string().starts_with("context:"));
+        assert!(id2.to_string().starts_with("context:"));
+    }
+
+    #[test]
+    fn context_id_serializes_to_json() {
+        let context_id =
+            ContextID::from_human_readable("context:12345678-1234-1234-1234-123456789012").unwrap();
+        let json = serde_json::to_string(&context_id).unwrap();
+        assert_eq!(json, "\"context:12345678-1234-1234-1234-123456789012\"");
+    }
+
+    #[test]
+    fn context_id_deserializes_from_json() {
+        let json = "\"context:12345678-1234-1234-1234-123456789012\"";
+        let context_id: ContextID = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            context_id.to_string(),
+            "context:12345678-1234-1234-1234-123456789012"
+        );
+    }
+
+    #[test]
+    fn context_id_serde_roundtrip() {
+        let original = ContextID::generate().unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: ContextID = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn different_id_types_are_distinct() {
+        // Generate IDs with similar UUIDs but different prefixes
+        let uuid_str = "12345678-1234-1234-1234-123456789012";
+
+        let agent_id = AgentID::from_human_readable(&format!("agent:{}", uuid_str)).unwrap();
+        let tx_id = TransactionID::from_human_readable(&format!("tx:{}", uuid_str)).unwrap();
+        let mount_id = MountID::from_human_readable(&format!("mount:{}", uuid_str)).unwrap();
+        let context_id = ContextID::from_human_readable(&format!("context:{}", uuid_str)).unwrap();
+
+        // Verify they have different string representations
+        assert_ne!(agent_id.to_string(), tx_id.to_string());
+        assert_ne!(agent_id.to_string(), mount_id.to_string());
+        assert_ne!(agent_id.to_string(), context_id.to_string());
+        assert_ne!(tx_id.to_string(), mount_id.to_string());
+        assert_ne!(tx_id.to_string(), context_id.to_string());
+        assert_ne!(mount_id.to_string(), context_id.to_string());
+    }
+
+    #[test]
+    fn id_equality_works() {
+        let id1 =
+            AgentID::from_human_readable("agent:12345678-1234-1234-1234-123456789012").unwrap();
+        let id2 =
+            AgentID::from_human_readable("agent:12345678-1234-1234-1234-123456789012").unwrap();
+        let id3 =
+            AgentID::from_human_readable("agent:87654321-4321-4321-4321-210987654321").unwrap();
+
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+        assert_ne!(id2, id3);
+    }
+
+    #[test]
+    fn id_handles_empty_string() {
+        assert!(AgentID::from_human_readable("").is_none());
+        assert!(TransactionID::from_human_readable("").is_none());
+        assert!(MountID::from_human_readable("").is_none());
+        assert!(ContextID::from_human_readable("").is_none());
+    }
+
+    #[test]
+    fn id_handles_only_prefix() {
+        assert!(AgentID::from_human_readable("agent:").is_none());
+        assert!(TransactionID::from_human_readable("tx:").is_none());
+        assert!(MountID::from_human_readable("mount:").is_none());
+        assert!(ContextID::from_human_readable("context:").is_none());
+    }
+
+    #[test]
+    fn id_handles_missing_colon() {
+        assert!(
+            AgentID::from_human_readable("agent00000000-0000-0000-0000-000000000001").is_none()
+        );
+        assert!(
+            TransactionID::from_human_readable("tx00000000-0000-0000-0000-000000000001").is_none()
+        );
+        assert!(
+            MountID::from_human_readable("mount00000000-0000-0000-0000-000000000001").is_none()
+        );
+        assert!(
+            ContextID::from_human_readable("context00000000-0000-0000-0000-000000000001").is_none()
+        );
+    }
+
+    #[test]
+    fn id_handles_case_sensitive_prefix() {
+        // Prefixes should be case sensitive
+        assert!(
+            AgentID::from_human_readable("AGENT:00000000-0000-0000-0000-000000000001").is_none()
+        );
+        assert!(
+            TransactionID::from_human_readable("TX:00000000-0000-0000-0000-000000000001").is_none()
+        );
+        assert!(
+            MountID::from_human_readable("MOUNT:00000000-0000-0000-0000-000000000001").is_none()
+        );
+        assert!(
+            ContextID::from_human_readable("CONTEXT:00000000-0000-0000-0000-000000000001")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn id_handles_uuid_with_wrong_format() {
+        // Wrong number of dashes
+        assert!(AgentID::from_human_readable("agent:00000000000000000000000000000001").is_none());
+        // Wrong length segments
+        assert!(AgentID::from_human_readable("agent:000-00-00-00-000").is_none());
+        // Non-hex characters
+        assert!(
+            AgentID::from_human_readable("agent:gggggggg-gggg-gggg-gggg-gggggggggggg").is_none()
+        );
+    }
+
+    #[test]
+    fn serde_error_handling_non_string() {
+        // Test deserialization from non-string JSON values
+        let invalid_json = "123";
+        let result: Result<AgentID, _> = serde_json::from_str(invalid_json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serde_error_handling_null() {
+        let null_json = "null";
+        let result: Result<AgentID, _> = serde_json::from_str(null_json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serde_error_handling_array() {
+        let array_json = "[\"agent:00000000-0000-0000-0000-000000000001\"]";
+        let result: Result<AgentID, _> = serde_json::from_str(array_json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn id_with_minimum_uuid() {
+        let min_uuid = "00000000-0000-0000-0000-000000000000";
+
+        let agent_id = AgentID::from_human_readable(&format!("agent:{}", min_uuid));
+        let tx_id = TransactionID::from_human_readable(&format!("tx:{}", min_uuid));
+        let mount_id = MountID::from_human_readable(&format!("mount:{}", min_uuid));
+        let context_id = ContextID::from_human_readable(&format!("context:{}", min_uuid));
+
+        assert!(agent_id.is_some());
+        assert!(tx_id.is_some());
+        assert!(mount_id.is_some());
+        assert!(context_id.is_some());
+    }
+
+    #[test]
+    fn id_with_maximum_uuid() {
+        let max_uuid = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+
+        let agent_id = AgentID::from_human_readable(&format!("agent:{}", max_uuid));
+        let tx_id = TransactionID::from_human_readable(&format!("tx:{}", max_uuid));
+        let mount_id = MountID::from_human_readable(&format!("mount:{}", max_uuid));
+        let context_id = ContextID::from_human_readable(&format!("context:{}", max_uuid));
+
+        assert!(agent_id.is_some());
+        assert!(tx_id.is_some());
+        assert!(mount_id.is_some());
+        assert!(context_id.is_some());
+    }
+
+    #[test]
+    fn generated_ids_have_correct_format() {
+        let agent_id = AgentID::generate().unwrap();
+        let tx_id = TransactionID::generate().unwrap();
+        let mount_id = MountID::generate().unwrap();
+        let context_id = ContextID::generate().unwrap();
+
+        // Verify format: prefix:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        let agent_str = agent_id.to_string();
+        let tx_str = tx_id.to_string();
+        let mount_str = mount_id.to_string();
+        let context_str = context_id.to_string();
+
+        assert!(agent_str.starts_with("agent:"));
+        assert_eq!(agent_str.len(), "agent:".len() + 36); // UUID is 36 chars
+        assert_eq!(agent_str.matches('-').count(), 4); // UUID has 4 dashes
+
+        assert!(tx_str.starts_with("tx:"));
+        assert_eq!(tx_str.len(), "tx:".len() + 36);
+        assert_eq!(tx_str.matches('-').count(), 4);
+
+        assert!(mount_str.starts_with("mount:"));
+        assert_eq!(mount_str.len(), "mount:".len() + 36);
+        assert_eq!(mount_str.matches('-').count(), 4);
+
+        assert!(context_str.starts_with("context:"));
+        assert_eq!(context_str.len(), "context:".len() + 36);
+        assert_eq!(context_str.matches('-').count(), 4);
     }
 }
