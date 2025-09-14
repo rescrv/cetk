@@ -95,24 +95,22 @@ const AGENT_TABLE_ID: u32 = 1;
 const AGENT_CREATED_AT_FIELD: u32 = 2; // corresponds to 2_A in EXAMPLE.md
 const AGENT_UPDATED_AT_FIELD: u32 = 3; // corresponds to 3_A in EXAMPLE.md
 
-/// Key for Agent's created_at field: (TableSetID, 1_A, 1_B, agent_id, 2_A)
+/// Generic key for Agent field storage
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct AgentCreatedAtKey {
+pub struct AgentFieldKey<const FIELD_ID: u32> {
     pub agent_id: AgentID,
 }
 
-/// Key for Agent's updated_at field: (TableSetID, 1_A, 1_B, agent_id, 3_A)
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct AgentUpdatedAtKey {
-    pub agent_id: AgentID,
-}
+/// Type aliases for specific Agent fields - maintains API compatibility
+pub type AgentCreatedAtKey = AgentFieldKey<AGENT_CREATED_AT_FIELD>;
+pub type AgentUpdatedAtKey = AgentFieldKey<AGENT_UPDATED_AT_FIELD>;
 
-impl AgentCreatedAtKey {
+impl<const FIELD_ID: u32> AgentFieldKey<FIELD_ID> {
     pub fn new(agent_id: AgentID) -> Self {
         Self { agent_id }
     }
 
-    /// Pack key as binary tuple: (TableSetID, 1_A, 1_B, agent_id, 2_A)
+    /// Pack key as binary tuple: (TableSetID, 1_A, 1_B, agent_id, FIELD_ID)
     pub fn pack(&self) -> Vec<u8> {
         let mut key = Vec::new();
         // TODO(claude): Use proper TableSetID from configuration
@@ -120,7 +118,7 @@ impl AgentCreatedAtKey {
         key.extend_from_slice(&AGENT_TABLE_ID.to_be_bytes()); // 1_A
         key.extend_from_slice(&1u32.to_be_bytes()); // 1_B (agent_id field ID)
         key.extend_from_slice(&self.agent_id.id); // agent_id
-        key.extend_from_slice(&AGENT_CREATED_AT_FIELD.to_be_bytes()); // 2_A
+        key.extend_from_slice(&FIELD_ID.to_be_bytes()); // field ID
         key
     }
 
@@ -163,85 +161,14 @@ impl AgentCreatedAtKey {
         let agent_id = AgentID::new(agent_id_array);
         offset += 16;
 
-        // Check field ID (AGENT_CREATED_AT_FIELD)
+        // Check field ID matches const generic parameter
         let field_id = u32::from_be_bytes([
             key[offset],
             key[offset + 1],
             key[offset + 2],
             key[offset + 3],
         ]);
-        if field_id != AGENT_CREATED_AT_FIELD {
-            return Err("invalid field ID");
-        }
-
-        Ok(Self { agent_id })
-    }
-}
-
-impl AgentUpdatedAtKey {
-    pub fn new(agent_id: AgentID) -> Self {
-        Self { agent_id }
-    }
-
-    /// Pack key as binary tuple: (TableSetID, 1_A, 1_B, agent_id, 3_A)
-    pub fn pack(&self) -> Vec<u8> {
-        let mut key = Vec::new();
-        // TODO(claude): Use proper TableSetID from configuration
-        key.extend_from_slice(&1u32.to_be_bytes()); // TableSetID
-        key.extend_from_slice(&AGENT_TABLE_ID.to_be_bytes()); // 1_A
-        key.extend_from_slice(&1u32.to_be_bytes()); // 1_B (agent_id field ID)
-        key.extend_from_slice(&self.agent_id.id); // agent_id
-        key.extend_from_slice(&AGENT_UPDATED_AT_FIELD.to_be_bytes()); // 3_A
-        key
-    }
-
-    /// Unpack key from binary tuple format
-    pub fn unpack(key: &[u8]) -> Result<Self, &'static str> {
-        if key.len() < 20 {
-            // 4 + 4 + 4 + 16 (min AgentID) + 4
-            return Err("key too short");
-        }
-
-        let mut offset = 0;
-
-        // Skip TableSetID (4 bytes)
-        offset += 4;
-
-        // Check 1_A (AGENT_TABLE_ID)
-        let table_id = u32::from_be_bytes([
-            key[offset],
-            key[offset + 1],
-            key[offset + 2],
-            key[offset + 3],
-        ]);
-        if table_id != AGENT_TABLE_ID {
-            return Err("invalid table ID");
-        }
-        offset += 4;
-
-        // Skip 1_B (4 bytes)
-        offset += 4;
-
-        // Extract agent_id (16 bytes for UUID)
-        if key.len() < offset + 16 + 4 {
-            return Err("key too short for agent_id");
-        }
-
-        let agent_id_bytes = &key[offset..offset + 16];
-        let agent_id_array: [u8; 16] = agent_id_bytes
-            .try_into()
-            .map_err(|_| "invalid agent_id length")?;
-        let agent_id = AgentID::new(agent_id_array);
-        offset += 16;
-
-        // Check field ID (AGENT_UPDATED_AT_FIELD)
-        let field_id = u32::from_be_bytes([
-            key[offset],
-            key[offset + 1],
-            key[offset + 2],
-            key[offset + 3],
-        ]);
-        if field_id != AGENT_UPDATED_AT_FIELD {
+        if field_id != FIELD_ID {
             return Err("invalid field ID");
         }
 
@@ -283,52 +210,110 @@ impl Agent {
         self.updated_at = std::time::SystemTime::now();
     }
 
+    /// Convert SystemTime to microseconds since Unix epoch
+    fn timestamp_to_micros(
+        timestamp: std::time::SystemTime,
+        field_name: &str,
+    ) -> Result<u64, AgentBatchError> {
+        timestamp
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| {
+                AgentBatchError::SerializationFailed(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid {} timestamp", field_name),
+                )))
+            })?
+            .as_micros()
+            .try_into()
+            .map_err(|_| {
+                AgentBatchError::SerializationFailed(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{} timestamp too large", field_name),
+                )))
+            })
+    }
+
+    /// Load a timestamp field from cursor
+    fn load_timestamp_field<C: Cursor>(
+        cursor: &mut C,
+        key_bytes: Vec<u8>,
+        field_name: &str,
+    ) -> Result<Option<std::time::SystemTime>, AgentCursorError> {
+        cursor.seek(&key_bytes)?;
+
+        if let Some(key) = cursor.key() {
+            if key.key == key_bytes {
+                if let Some(value) = cursor.value() {
+                    if value.len() == 8 {
+                        let timestamp_array: [u8; 8] = value.try_into().map_err(|_| {
+                            AgentCursorError::DeserializationFailed(serde_json::Error::io(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("invalid {} bytes", field_name),
+                                ),
+                            ))
+                        })?;
+                        let timestamp_micros = u64::from_be_bytes(timestamp_array);
+                        let timestamp = std::time::UNIX_EPOCH
+                            + std::time::Duration::from_micros(timestamp_micros);
+                        Ok(Some(timestamp))
+                    } else {
+                        Err(AgentCursorError::DeserializationFailed(
+                            serde_json::Error::io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("invalid {} length", field_name),
+                            )),
+                        ))
+                    }
+                } else {
+                    // Tombstone - field was deleted
+                    Ok(None)
+                }
+            } else {
+                // Key not found
+                Ok(None)
+            }
+        } else {
+            // No key found
+            Ok(None)
+        }
+    }
+
+    /// Create a KeyValueRef for insertion
+    fn create_insert_kvr<'a>(key: &'a [u8], value: &'a [u8]) -> KeyValueRef<'a> {
+        KeyValueRef {
+            key,
+            timestamp: 0,
+            value: Some(value),
+        }
+    }
+
+    /// Create a KeyValueRef for deletion (tombstone)
+    fn create_delete_kvr<'a>(key: &'a [u8]) -> KeyValueRef<'a> {
+        KeyValueRef {
+            key,
+            timestamp: 0,
+            value: None,
+        }
+    }
+
     /// Save this agent to the provided WriteBatch.
     /// This stores the agent as multiple key-value pairs following EXAMPLE.md pattern.
     pub fn save_to_batch(&self, batch: &mut WriteBatch) -> Result<(), AgentBatchError> {
         // Store created_at field
         let created_at_key = AgentCreatedAtKey::new(self.agent_id);
         let created_at_key_bytes = created_at_key.pack();
-        let created_at_timestamp_us = self
-            .created_at
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| {
-                AgentBatchError::SerializationFailed(serde_json::Error::io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid created_at timestamp",
-                )))
-            })?
-            .as_micros() as u64;
+        let created_at_timestamp_us = Self::timestamp_to_micros(self.created_at, "created_at")?;
         let created_at_bytes = created_at_timestamp_us.to_be_bytes();
-
-        let created_at_kvr = KeyValueRef {
-            key: &created_at_key_bytes,
-            timestamp: 0,
-            value: Some(&created_at_bytes),
-        };
-
+        let created_at_kvr = Self::create_insert_kvr(&created_at_key_bytes, &created_at_bytes);
         batch.insert(created_at_kvr)?;
 
         // Store updated_at field
         let updated_at_key = AgentUpdatedAtKey::new(self.agent_id);
         let updated_at_key_bytes = updated_at_key.pack();
-        let updated_at_timestamp_us = self
-            .updated_at
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| {
-                AgentBatchError::SerializationFailed(serde_json::Error::io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid updated_at timestamp",
-                )))
-            })?
-            .as_micros() as u64;
+        let updated_at_timestamp_us = Self::timestamp_to_micros(self.updated_at, "updated_at")?;
         let updated_at_bytes = updated_at_timestamp_us.to_be_bytes();
-
-        let updated_at_kvr = KeyValueRef {
-            key: &updated_at_key_bytes,
-            timestamp: 0,
-            value: Some(&updated_at_bytes),
-        };
+        let updated_at_kvr = Self::create_insert_kvr(&updated_at_key_bytes, &updated_at_bytes);
 
         Ok(batch.insert(updated_at_kvr)?)
     }
@@ -339,24 +324,13 @@ impl Agent {
         // Delete created_at field
         let created_at_key = AgentCreatedAtKey::new(self.agent_id);
         let created_at_key_bytes = created_at_key.pack();
-
-        let created_at_kvr = KeyValueRef {
-            key: &created_at_key_bytes,
-            timestamp: 0,
-            value: None,
-        };
-
+        let created_at_kvr = Self::create_delete_kvr(&created_at_key_bytes);
         batch.insert(created_at_kvr)?;
 
         // Delete updated_at field
         let updated_at_key = AgentUpdatedAtKey::new(self.agent_id);
         let updated_at_key_bytes = updated_at_key.pack();
-
-        let updated_at_kvr = KeyValueRef {
-            key: &updated_at_key_bytes,
-            timestamp: 0,
-            value: None,
-        };
+        let updated_at_kvr = Self::create_delete_kvr(&updated_at_key_bytes);
 
         Ok(batch.insert(updated_at_kvr)?)
     }
@@ -371,83 +345,21 @@ impl Agent {
         let created_at_key = AgentCreatedAtKey::new(agent_id);
         let created_at_key_bytes = created_at_key.pack();
 
-        cursor.seek(&created_at_key_bytes)?;
-
-        let created_at = if let Some(key) = cursor.key() {
-            if key.key == created_at_key_bytes {
-                if let Some(value) = cursor.value() {
-                    if value.len() == 8 {
-                        let timestamp_array: [u8; 8] = value.try_into().map_err(|_| {
-                            AgentCursorError::DeserializationFailed(serde_json::Error::io(
-                                std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "invalid created_at bytes",
-                                ),
-                            ))
-                        })?;
-                        let timestamp_us = u64::from_be_bytes(timestamp_array);
-                        std::time::UNIX_EPOCH + std::time::Duration::from_micros(timestamp_us)
-                    } else {
-                        return Err(AgentCursorError::DeserializationFailed(
-                            serde_json::Error::io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "invalid created_at length",
-                            )),
-                        ));
-                    }
-                } else {
-                    // Tombstone - agent was deleted
-                    return Ok(None);
-                }
-            } else {
-                // Key not found
-                return Ok(None);
-            }
-        } else {
-            // No key found
-            return Ok(None);
-        };
+        let created_at =
+            match Self::load_timestamp_field(cursor, created_at_key_bytes, "created_at")? {
+                Some(timestamp) => timestamp,
+                None => return Ok(None), // Agent was deleted or doesn't exist
+            };
 
         // Try to load updated_at field
         let updated_at_key = AgentUpdatedAtKey::new(agent_id);
         let updated_at_key_bytes = updated_at_key.pack();
 
-        cursor.seek(&updated_at_key_bytes)?;
-
-        let updated_at = if let Some(key) = cursor.key() {
-            if key.key == updated_at_key_bytes {
-                if let Some(value) = cursor.value() {
-                    if value.len() == 8 {
-                        let timestamp_array: [u8; 8] = value.try_into().map_err(|_| {
-                            AgentCursorError::DeserializationFailed(serde_json::Error::io(
-                                std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "invalid updated_at bytes",
-                                ),
-                            ))
-                        })?;
-                        let timestamp_us = u64::from_be_bytes(timestamp_array);
-                        std::time::UNIX_EPOCH + std::time::Duration::from_micros(timestamp_us)
-                    } else {
-                        return Err(AgentCursorError::DeserializationFailed(
-                            serde_json::Error::io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "invalid updated_at length",
-                            )),
-                        ));
-                    }
-                } else {
-                    // Tombstone - agent was deleted
-                    return Ok(None);
-                }
-            } else {
-                // Key not found
-                return Ok(None);
-            }
-        } else {
-            // No key found
-            return Ok(None);
-        };
+        let updated_at =
+            match Self::load_timestamp_field(cursor, updated_at_key_bytes, "updated_at")? {
+                Some(timestamp) => timestamp,
+                None => return Ok(None), // Agent was deleted or doesn't exist
+            };
 
         Ok(Some(Agent {
             agent_id,

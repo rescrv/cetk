@@ -15,7 +15,6 @@ table Agent(string agent_id = 1_B) @ 1_A {
         column Transaction(uint32 transaction_seq_no = 1_D) @ 1_E {
             repeated MessageParam messages = 2_B;
             repeated FileWrite writes = 3_B;
-            }
         }
     }
 }
