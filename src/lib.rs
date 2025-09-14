@@ -5,27 +5,24 @@
 //! This crate provides core types and utilities for the Context Engineer's Toolkit:
 //!
 //! ```rust
-//! use cetk::{Transaction, AgentID};
+//! use cetk::{Agent, AgentID};
 //!
 //! # fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Create a transaction
+//! // Create an agent
 //! let agent_id = AgentID::from_human_readable("agent:00000000-0000-0000-0000-000000000001").unwrap();
-//! let transaction = Transaction {
-//!     agent_id,
-//!     context_seq_no: 1,
-//!     transaction_seq_no: 42,
-//!     msgs: vec![],
-//!     writes: vec![],
-//! };
+//! let agent = Agent::new(agent_id);
 //!
-//! println!("Transaction created for agent: {}", transaction.agent_id);
+//! println!("Agent created with ID: {}", agent.agent_id);
 //! # Ok(())
 //! # }
 //! ```
 
 use one_two_eight::generate_id;
 
-mod agent;
+pub mod agent;
+
+// Re-export agent types for convenience
+pub use agent::{Agent, AgentBatchError, AgentCreatedAtKey, AgentCursorError, AgentUpdatedAtKey};
 
 ///////////////////////////////////////////// Constants ////////////////////////////////////////////
 
