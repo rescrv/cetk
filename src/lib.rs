@@ -25,8 +25,10 @@
 
 use one_two_eight::generate_id;
 
+mod orm;
 mod transaction;
 
+pub use orm::{Agent, Context, ContextTransaction, Key, MemoryStorage, Orm, OrmError, TableSetID};
 pub use transaction::Transaction;
 
 ///////////////////////////////////////////// Constants ////////////////////////////////////////////

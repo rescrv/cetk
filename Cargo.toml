@@ -11,6 +11,11 @@ serde = "1.0.219"
 serde_json = "1.0.141"
 utf8path = "0.9.1"
 handled = "0.5.0"
+tuple_key = "0.13.0"
+tuple_key_derive = "0.11.0"
+prototk = "0.13.0"
+zerror_core = "0.13.0"
+buffertk = "0.13.0"
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
