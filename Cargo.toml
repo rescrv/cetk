@@ -16,6 +16,8 @@ tuple_key_derive = "0.11.0"
 prototk = "0.13.0"
 zerror_core = "0.13.0"
 buffertk = "0.13.0"
+chrono = "0.4.42"
+chrono-tz = "0.10.4"
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }

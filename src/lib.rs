@@ -25,21 +25,31 @@
 
 use one_two_eight::generate_id;
 
-mod orm;
-mod transaction;
-
-pub use orm::{Agent, Context, ContextTransaction, Key, MemoryStorage, Orm, OrmError, TableSetID};
-pub use transaction::Transaction;
+mod agent;
 
 ///////////////////////////////////////////// Constants ////////////////////////////////////////////
 
-const CHUNK_SIZE_LIMIT: usize = 8192;
+pub const CHUNK_SIZE_LIMIT: usize = 8192;
 
 ///////////////////////////////////////// generate_id_serde ////////////////////////////////////////
 
 /// Generate the serde Deserialize/Serialize routines for a one_two_eight ID.
-macro_rules! generate_id_serde {
+macro_rules! generate_id_crate {
     ($name:ident, $visitor:ident) => {
+        impl tuple_key::Element for $name {
+            const DATA_TYPE: tuple_key::KeyDataType = tuple_key::KeyDataType::string;
+
+            fn append_to(&self, key: &mut tuple_key::TupleKey) {
+                self.prefix_free_readable().append_to(key);
+            }
+
+            fn parse_from(bytes: &[u8]) -> Result<Self, &'static str> {
+                let uuid_str = String::parse_from(bytes)?;
+                let id_bytes = one_two_eight::decode(&uuid_str).ok_or("invalid UUID format")?;
+                Ok(Self::new(id_bytes))
+            }
+        }
+
         impl serde::Serialize for $name {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
@@ -81,22 +91,22 @@ macro_rules! generate_id_serde {
 ////////////////////////////////////////////// AgentID /////////////////////////////////////////////
 
 generate_id!(AgentID, "agent:");
-generate_id_serde!(AgentID, AgentIDVisitor);
+generate_id_crate!(AgentID, AgentIDVisitor);
 
 /////////////////////////////////////////// TransactionID //////////////////////////////////////////
 
 generate_id!(TransactionID, "tx:");
-generate_id_serde!(TransactionID, TransactionIDVisitor);
+generate_id_crate!(TransactionID, TransactionIDVisitor);
 
 ////////////////////////////////////////////// MountID /////////////////////////////////////////////
 
 generate_id!(MountID, "mount:");
-generate_id_serde!(MountID, MountIDVisitor);
+generate_id_crate!(MountID, MountIDVisitor);
 
 ///////////////////////////////////////////// ContextID ////////////////////////////////////////////
 
 generate_id!(ContextID, "context:");
-generate_id_serde!(ContextID, ContextIDVisitor);
+generate_id_crate!(ContextID, ContextIDVisitor);
 
 #[cfg(test)]
 mod tests {
