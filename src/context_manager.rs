@@ -850,28 +850,46 @@ impl ContextManager {
     /// Load all transaction data for a given agent, organizing it by contexts and transactions.
     ///
     /// This method:
-    /// 1. Queries ChromaDB for all chunks belonging to the agent
+    /// 1. Queries ChromaDB for all chunks belonging to the agent in batches (to handle 300 result limit)
     /// 2. Groups chunks by context and transaction
     /// 3. Assembles complete transactions from their chunks
     /// 4. Returns organized agent data with contexts and transactions
     pub async fn load_agent(&self, agent_id: AgentID) -> Result<AgentData, ContextManagerError> {
-        // Query all chunks for this agent
-        let agent_filter = filters::eq("agent_id", agent_id.to_string());
-        let get_options = GetOptions::new()
-            .where_metadata(agent_filter)
-            .include(vec!["metadatas".to_string(), "documents".to_string()]);
+        let mut all_chunks = Vec::new();
+        let batch_size = 300; // ChromaDB server-side limit
+        let mut offset = 0;
 
-        let result = self
-            .collection
-            .get(get_options)
-            .await
-            .map_err(|e| ContextManagerError::ChromaError(e.to_string()))?;
+        loop {
+            // Query chunks for this agent in batches
+            let agent_filter = filters::eq("agent_id", agent_id.to_string());
+            let get_options = GetOptions::new()
+                .where_metadata(agent_filter)
+                .limit(batch_size)
+                .offset(offset)
+                .include(vec!["metadatas".to_string(), "documents".to_string()]);
 
-        // Convert ChromaDB result to TransactionChunks
-        let chunks = self.convert_chroma_result_to_chunks(result)?;
+            let result = self
+                .collection
+                .get(get_options)
+                .await
+                .map_err(|e| ContextManagerError::ChromaError(e.to_string()))?;
+
+            // Convert ChromaDB result to TransactionChunks
+            let batch_chunks = self.convert_chroma_result_to_chunks(result)?;
+
+            let batch_size_returned = batch_chunks.len();
+            all_chunks.extend(batch_chunks);
+
+            // If we got fewer results than requested, we've reached the end
+            if batch_size_returned < batch_size {
+                break;
+            }
+
+            offset += batch_size;
+        }
 
         // Organize chunks by context and transaction, then assemble
-        let agent_data = self.assemble_agent_data(agent_id, chunks)?;
+        let agent_data = self.assemble_agent_data(agent_id, all_chunks)?;
 
         Ok(agent_data)
     }
