@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chromadb::{
     MetadataValue,
     collection::{ChromaCollection, CollectionEntries, GetOptions},
-    filters::{self, MetadataFilter},
+    filters,
 };
 
 use crate::{AgentID, EmbeddingService, FileWrite, Transaction, TransactionChunk, TransactionID};
@@ -140,6 +140,68 @@ impl AgentData {
     ) -> TransactionBuilder<'a> {
         TransactionBuilder::new_in_next_context(self, context_manager)
     }
+
+    /// Get the content of a file from the most recent version in transaction history
+    pub fn get_file_content(&self, mount: crate::MountID, path: &str) -> Option<String> {
+        // Search through all transactions in reverse chronological order
+        // to find the most recent write to this file
+        for context in self.contexts.iter().rev() {
+            for transaction in context.transactions.iter().rev() {
+                for write in transaction.writes.iter().rev() {
+                    if write.mount == mount && write.path == path {
+                        return Some(write.data.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// List all files that have been written in transaction history for a mount
+    pub fn list_files(&self, mount: crate::MountID) -> Vec<String> {
+        let mut files = std::collections::HashSet::new();
+
+        for context in &self.contexts {
+            for transaction in &context.transactions {
+                for write in &transaction.writes {
+                    if write.mount == mount {
+                        files.insert(write.path.clone());
+                    }
+                }
+            }
+        }
+
+        let mut result: Vec<String> = files.into_iter().collect();
+        result.sort();
+        result
+    }
+
+    /// Search for files containing a pattern in their content
+    pub fn search_file_contents(
+        &self,
+        mount: crate::MountID,
+        pattern: &str,
+    ) -> Vec<(String, Vec<String>)> {
+        let mut matches = Vec::new();
+        let files = self.list_files(mount);
+
+        for file_path in files {
+            if let Some(content) = self.get_file_content(mount, &file_path) {
+                let matching_lines: Vec<String> = content
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| line.contains(pattern))
+                    .map(|(line_num, line)| format!("{}:{}", line_num + 1, line))
+                    .collect();
+
+                if !matching_lines.is_empty() {
+                    matches.push((file_path, matching_lines));
+                }
+            }
+        }
+
+        matches
+    }
 }
 
 //////////////////////////////////////// TransactionBuilder ////////////////////////////////////////
@@ -242,6 +304,85 @@ impl<'a> TransactionBuilder<'a> {
     pub fn write_files(mut self, writes: Vec<FileWrite>) -> Self {
         self.writes.extend(writes);
         self
+    }
+
+    /// View the current content of a file from transaction history
+    pub fn view_file(&self, mount: crate::MountID, path: &str) -> Option<String> {
+        self.agent_data.get_file_content(mount, path)
+    }
+
+    /// Search for files containing a pattern in their content
+    pub fn search_files(&self, mount: crate::MountID, pattern: &str) -> Vec<(String, Vec<String>)> {
+        self.agent_data.search_file_contents(mount, pattern)
+    }
+
+    /// List all files that have been written for a mount
+    pub fn list_files(&self, mount: crate::MountID) -> Vec<String> {
+        self.agent_data.list_files(mount)
+    }
+
+    /// Perform a string replacement in an existing file and add the result as a write
+    pub fn str_replace_file<P: Into<String>>(
+        mut self,
+        mount: crate::MountID,
+        path: P,
+        old_content: &str,
+        new_content: &str,
+    ) -> Result<Self, String> {
+        let path_str = path.into();
+        if let Some(current_content) = self.agent_data.get_file_content(mount, &path_str) {
+            if !current_content.contains(old_content) {
+                return Err(format!(
+                    "Content '{}' not found in file {}",
+                    old_content, path_str
+                ));
+            }
+            let updated_content = current_content.replace(old_content, new_content);
+            self.writes.push(FileWrite {
+                mount,
+                path: path_str,
+                data: updated_content,
+            });
+            Ok(self)
+        } else {
+            Err(format!("File {} not found", path_str))
+        }
+    }
+
+    /// Insert content into a file (creates new file or overwrites existing)
+    pub fn insert_file<P: Into<String>, D: Into<String>>(
+        mut self,
+        mount: crate::MountID,
+        path: P,
+        content: D,
+    ) -> Self {
+        self.writes.push(FileWrite {
+            mount,
+            path: path.into(),
+            data: content.into(),
+        });
+        self
+    }
+
+    /// Get the current buffered content for a file (considering both transaction history and pending writes)
+    pub fn get_buffered_content(&self, mount: crate::MountID, path: &str) -> Option<String> {
+        // First check pending writes in reverse order (most recent first)
+        for write in self.writes.iter().rev() {
+            if write.mount == mount && write.path == path {
+                return Some(write.data.clone());
+            }
+        }
+        // Fall back to transaction history
+        self.agent_data.get_file_content(mount, path)
+    }
+
+    /// Get a summary of all pending writes
+    pub fn get_write_summary(&self) -> Vec<(crate::MountID, String, usize)> {
+        let mut summary = Vec::new();
+        for write in &self.writes {
+            summary.push((write.mount, write.path.clone(), write.data.len()));
+        }
+        summary
     }
 
     /// Complete the transaction builder and persist it to ChromaDB.
@@ -1349,5 +1490,216 @@ mod tests {
 
         assert_eq!(tx3.context_seq_no, 2);
         assert_eq!(tx3.transaction_seq_no, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_data_file_reading() {
+        let client = create_test_client().await;
+
+        if let Err(e) = client.heartbeat().await {
+            println!("TODO(claude): cleanup this output");
+            println!("Skipping test - ChromaDB not available: {:?}", e);
+            return;
+        }
+
+        let collection_name = format!("test_agent_file_reading_{}", rand::random::<u32>());
+        let collection = client
+            .get_or_create_collection(&collection_name, None, None)
+            .await
+            .unwrap();
+
+        let context_manager = ContextManager::new(collection).unwrap();
+        let agent_id = AgentID::generate().unwrap();
+        let mount_id = crate::MountID::generate().unwrap();
+
+        // Create initial transaction with some files
+        let mut agent_data = AgentData {
+            agent_id,
+            contexts: Vec::new(),
+        };
+
+        let _nonce = agent_data
+            .new_context(&context_manager)
+            .write_file(mount_id, "/file1.txt", "First file content")
+            .write_file(mount_id, "/file2.txt", "Second file content")
+            .write_file(mount_id, "/subdir/file3.txt", "Third file content")
+            .save()
+            .await
+            .unwrap();
+
+        // Test get_file_content
+        assert_eq!(
+            agent_data.get_file_content(mount_id, "/file1.txt"),
+            Some("First file content".to_string())
+        );
+        assert_eq!(
+            agent_data.get_file_content(mount_id, "/nonexistent.txt"),
+            None
+        );
+
+        // Test list_files
+        let files = agent_data.list_files(mount_id);
+        assert_eq!(files.len(), 3);
+        assert!(files.contains(&"/file1.txt".to_string()));
+        assert!(files.contains(&"/file2.txt".to_string()));
+        assert!(files.contains(&"/subdir/file3.txt".to_string()));
+
+        // Test search_file_contents
+        let matches = agent_data.search_file_contents(mount_id, "file");
+        assert_eq!(matches.len(), 3);
+        assert!(matches.iter().any(|(path, _)| path == "/file1.txt"));
+
+        let matches = agent_data.search_file_contents(mount_id, "Third");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, "/subdir/file3.txt");
+    }
+
+    #[tokio::test]
+    async fn transaction_builder_filesystem_methods() {
+        let client = create_test_client().await;
+
+        if let Err(e) = client.heartbeat().await {
+            println!("TODO(claude): cleanup this output");
+            println!("Skipping test - ChromaDB not available: {:?}", e);
+            return;
+        }
+
+        let collection_name = format!("test_builder_fs_{}", rand::random::<u32>());
+        let collection = client
+            .get_or_create_collection(&collection_name, None, None)
+            .await
+            .unwrap();
+
+        let context_manager = ContextManager::new(collection).unwrap();
+        let agent_id = AgentID::generate().unwrap();
+        let mount_id = crate::MountID::generate().unwrap();
+
+        // Create initial transaction
+        let mut agent_data = AgentData {
+            agent_id,
+            contexts: Vec::new(),
+        };
+
+        let _nonce = agent_data
+            .new_context(&context_manager)
+            .write_file(mount_id, "/original.txt", "Original content")
+            .save()
+            .await
+            .unwrap();
+
+        // Test TransactionBuilder filesystem methods
+        let builder = agent_data.next_transaction(&context_manager);
+
+        // Test view_file
+        assert_eq!(
+            builder.view_file(mount_id, "/original.txt"),
+            Some("Original content".to_string())
+        );
+        assert_eq!(builder.view_file(mount_id, "/nonexistent.txt"), None);
+
+        // Test list_files
+        let files = builder.list_files(mount_id);
+        assert_eq!(files.len(), 1);
+        assert!(files.contains(&"/original.txt".to_string()));
+
+        // Test search_files
+        let matches = builder.search_files(mount_id, "Original");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, "/original.txt");
+
+        // Test str_replace_file
+        let builder = builder
+            .str_replace_file(mount_id, "/original.txt", "Original", "Modified")
+            .unwrap();
+
+        // Test get_buffered_content (should show the modified version)
+        assert_eq!(
+            builder.get_buffered_content(mount_id, "/original.txt"),
+            Some("Modified content".to_string())
+        );
+
+        // Test str_replace_file error cases
+        let builder2 = agent_data.next_transaction(&context_manager);
+        let result = builder2.str_replace_file(mount_id, "/nonexistent.txt", "old", "new");
+        assert!(result.is_err());
+        if let Err(error) = result {
+            assert!(error.contains("not found"));
+        }
+
+        let builder3 = agent_data.next_transaction(&context_manager);
+        let result = builder3.str_replace_file(mount_id, "/original.txt", "nonexistent", "new");
+        assert!(result.is_err());
+        if let Err(error) = result {
+            assert!(error.contains("not found"));
+        }
+
+        // Test insert_file
+        let builder4 = agent_data.next_transaction(&context_manager).insert_file(
+            mount_id,
+            "/new_file.txt",
+            "New file content",
+        );
+
+        assert_eq!(
+            builder4.get_buffered_content(mount_id, "/new_file.txt"),
+            Some("New file content".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn write_buffering_latest_wins() {
+        let client = create_test_client().await;
+
+        if let Err(e) = client.heartbeat().await {
+            println!("TODO(claude): cleanup this output");
+            println!("Skipping test - ChromaDB not available: {:?}", e);
+            return;
+        }
+
+        let collection_name = format!("test_write_buffering_{}", rand::random::<u32>());
+        let collection = client
+            .get_or_create_collection(&collection_name, None, None)
+            .await
+            .unwrap();
+
+        let context_manager = ContextManager::new(collection).unwrap();
+        let agent_id = AgentID::generate().unwrap();
+        let mount_id = crate::MountID::generate().unwrap();
+
+        let mut agent_data = AgentData {
+            agent_id,
+            contexts: Vec::new(),
+        };
+
+        // Test multiple writes to same file - latest should win
+        let builder = agent_data
+            .new_context(&context_manager)
+            .write_file(mount_id, "/multi_write.txt", "First write")
+            .write_file(mount_id, "/multi_write.txt", "Second write")
+            .write_file(mount_id, "/multi_write.txt", "Third write");
+
+        // Test get_buffered_content returns the latest write
+        assert_eq!(
+            builder.get_buffered_content(mount_id, "/multi_write.txt"),
+            Some("Third write".to_string())
+        );
+
+        // Test write summary shows all writes
+        let summary = builder.get_write_summary();
+        assert_eq!(summary.len(), 3); // All three writes present
+        assert!(
+            summary
+                .iter()
+                .all(|(_, path, _)| path == "/multi_write.txt")
+        );
+
+        // Save and verify the latest write persists
+        let _nonce = builder.save().await.unwrap();
+
+        // Verify that reading from agent data returns the latest write
+        assert_eq!(
+            agent_data.get_file_content(mount_id, "/multi_write.txt"),
+            Some("Third write".to_string())
+        );
     }
 }
