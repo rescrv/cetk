@@ -6,16 +6,18 @@
 
 use one_two_eight::generate_id;
 
+mod context_manager;
 mod embeddings;
 mod transaction;
-mod transaction_manager;
 
+pub use context_manager::{
+    AgentContext, AgentData, ContextManager, ContextManagerError, TransactionBuilder,
+};
 pub use embeddings::{EmbeddingModel, EmbeddingService};
 pub use transaction::{
     ChunkSizeExceededError, FileWrite, FromChunksError, InvariantViolation, Transaction,
     TransactionChunk, TransactionSerializationError,
 };
-pub use transaction_manager::{TransactionManager, TransactionManagerError};
 
 ///////////////////////////////////////////// Constants ////////////////////////////////////////////
 
