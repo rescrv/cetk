@@ -7,11 +7,13 @@
 use one_two_eight::generate_id;
 
 mod transaction;
+mod transaction_manager;
 
 pub use transaction::{
     ChunkSizeExceededError, FileWrite, FromChunksError, InvariantViolation, Transaction,
     TransactionChunk, TransactionSerializationError,
 };
+pub use transaction_manager::{TransactionManager, TransactionManagerError};
 
 ///////////////////////////////////////////// Constants ////////////////////////////////////////////
 
