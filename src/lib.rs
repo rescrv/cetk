@@ -6,9 +6,11 @@
 
 use one_two_eight::generate_id;
 
+mod embeddings;
 mod transaction;
 mod transaction_manager;
 
+pub use embeddings::{EmbeddingModel, EmbeddingService};
 pub use transaction::{
     ChunkSizeExceededError, FileWrite, FromChunksError, InvariantViolation, Transaction,
     TransactionChunk, TransactionSerializationError,

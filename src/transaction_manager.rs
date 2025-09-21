@@ -5,7 +5,7 @@ use chromadb::{
     collection::{ChromaCollection, CollectionEntries},
 };
 
-use crate::{AgentID, Transaction, TransactionID};
+use crate::{AgentID, EmbeddingService, Transaction, TransactionID};
 
 ////////////////////////////////////////////// Errors //////////////////////////////////////////////
 
@@ -18,6 +18,8 @@ pub enum TransactionManagerError {
     ChunkingError(crate::TransactionSerializationError),
     /// GUID generation failed.
     GuidError,
+    /// Error generating embeddings.
+    EmbeddingError(anyhow::Error),
 }
 
 impl std::fmt::Display for TransactionManagerError {
@@ -28,6 +30,7 @@ impl std::fmt::Display for TransactionManagerError {
                 write!(f, "Transaction chunking error: {}", e)
             }
             TransactionManagerError::GuidError => write!(f, "Failed to generate GUID"),
+            TransactionManagerError::EmbeddingError(e) => write!(f, "Embedding error: {}", e),
         }
     }
 }
@@ -38,6 +41,7 @@ impl std::error::Error for TransactionManagerError {
             TransactionManagerError::ChromaError(_) => None,
             TransactionManagerError::ChunkingError(e) => Some(e),
             TransactionManagerError::GuidError => None,
+            TransactionManagerError::EmbeddingError(e) => Some(e.as_ref()),
         }
     }
 }
@@ -45,6 +49,12 @@ impl std::error::Error for TransactionManagerError {
 impl From<crate::TransactionSerializationError> for TransactionManagerError {
     fn from(error: crate::TransactionSerializationError) -> Self {
         TransactionManagerError::ChunkingError(error)
+    }
+}
+
+impl From<anyhow::Error> for TransactionManagerError {
+    fn from(error: anyhow::Error) -> Self {
+        TransactionManagerError::EmbeddingError(error)
     }
 }
 
@@ -74,18 +84,23 @@ fn generate_chunk_id(
 /// 3. Can verify transaction persistence by checking if chunk[0] has the expected nonce
 pub struct TransactionManager {
     collection: ChromaCollection,
+    embedding_service: EmbeddingService,
 }
 
 impl TransactionManager {
     /// Create a new TransactionManager with a ChromaDB collection.
-    pub fn new(collection: ChromaCollection) -> Self {
-        TransactionManager { collection }
+    pub fn new(collection: ChromaCollection) -> Result<Self, TransactionManagerError> {
+        let embedding_service = EmbeddingService::new()?;
+        Ok(TransactionManager {
+            collection,
+            embedding_service,
+        })
     }
 
     /// Persist a transaction by chunking it and atomically storing all chunks with a nonce.
     ///
-    /// Returns the GUID that was used as the nonce if persistence succeeds.
-    /// The nonce can later be used with `verify_persistence` to confirm the transaction was stored.
+    /// Automatically verifies persistence before returning success.
+    /// Returns the GUID that was used as the nonce if persistence and verification succeed.
     pub async fn persist_transaction(
         &self,
         transaction: &Transaction,
@@ -146,8 +161,8 @@ impl TransactionManager {
         // Create documents from chunk data
         let documents: Vec<&str> = chunks.iter().map(|chunk| chunk.data.as_str()).collect();
 
-        // Create simple embeddings (zeros) for each chunk since we're using ChromaDB for metadata storage
-        let embeddings: Vec<Vec<f32>> = chunks.iter().map(|_| vec![0.0; 384]).collect();
+        // Generate real embeddings for each chunk using the embedding service
+        let embeddings = self.embedding_service.embed(&documents)?;
 
         let collection_entries = CollectionEntries {
             ids: chunk_id_refs,
@@ -161,6 +176,14 @@ impl TransactionManager {
             .add(collection_entries, None)
             .await
             .map_err(|e| TransactionManagerError::ChromaError(e.to_string()))?;
+
+        // Verify persistence before returning success
+        let verification_successful = self.verify_persistence(transaction, &nonce).await?;
+        if !verification_successful {
+            return Err(TransactionManagerError::ChromaError(
+                "Transaction persistence verification failed".to_string(),
+            ));
+        }
 
         Ok(nonce)
     }
@@ -258,7 +281,8 @@ mod tests {
             .get_or_create_collection("test_transactions", None, None)
             .await
             .expect("Failed to create ChromaDB collection");
-        let _manager = TransactionManager::new(collection);
+        let _manager =
+            TransactionManager::new(collection).expect("Failed to create TransactionManager");
         // Test passes if we can create the manager without panicking
     }
 
@@ -269,7 +293,8 @@ mod tests {
             .get_or_create_collection("test_transactions", None, None)
             .await
             .expect("Failed to create ChromaDB collection");
-        let manager = TransactionManager::new(collection);
+        let manager =
+            TransactionManager::new(collection).expect("Failed to create TransactionManager");
         let transaction = create_test_transaction();
 
         // Persist the transaction
@@ -298,7 +323,8 @@ mod tests {
             .get_or_create_collection("test_transactions", None, None)
             .await
             .expect("Failed to create ChromaDB collection");
-        let manager = TransactionManager::new(collection);
+        let manager =
+            TransactionManager::new(collection).expect("Failed to create TransactionManager");
 
         // Create a large transaction that will be chunked
         let large_content = "x".repeat(crate::CHUNK_SIZE_LIMIT * 2);
@@ -323,7 +349,8 @@ mod tests {
             .get_or_create_collection("test_transactions", None, None)
             .await
             .expect("Failed to create ChromaDB collection");
-        let manager = TransactionManager::new(collection);
+        let manager =
+            TransactionManager::new(collection).expect("Failed to create TransactionManager");
         let transaction = create_test_transaction();
         let fake_nonce = TransactionID::generate().unwrap().to_string();
 
