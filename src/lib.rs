@@ -1,8 +1,77 @@
+#![deny(missing_docs)]
 #![doc = include_str!("../README.md")]
 //!
-//! ## Context Engineer's Toolkit (CETK)
+//! # Context Engineer's Toolkit (CETK)
 //!
-//! This crate provides core types and utilities for the Context Engineer's Toolkit:
+//! CETK is a batteries-included framework for building long-lived, persistent agents with
+//! durable state, virtual filesystems, and semantic memory. It integrates with ChromaDB
+//! for vector storage and provides transactional guarantees for agent state management.
+//!
+//! ## Core Capabilities
+//!
+//! - **Durability**: Persist agent conversation history and state in ChromaDB with transactional guarantees
+//! - **Virtual Filesystems**: Mount-based virtual filesystems for agent file operations
+//! - **Context Management**: Hierarchical contexts with compaction and point-in-time restore
+//! - **Semantic Memory**: Both perfect memory (full history traversal) and fast memory (vector similarity)
+//! - **Transaction Safety**: Atomic operations with invariant checking and chunk-based storage
+//!
+//! ## Quick Start
+//!
+//! ```rust,no_run
+//! use cetk::{ContextManager, AgentID};
+//! use chromadb::ChromaClient;
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! // Connect to ChromaDB
+//! let client = ChromaClient::new(chromadb::client::ChromaClientOptions::default()).await?;
+//! let collection = client.get_or_create_collection("my_agent", None, None).await?;
+//!
+//! // Create a context manager
+//! let context_manager = ContextManager::new(collection)?;
+//!
+//! // Generate an agent ID
+//! let agent_id = AgentID::generate().unwrap();
+//!
+//! // Load or create agent data
+//! let mut agent_data = context_manager.load_agent(agent_id).await?;
+//!
+//! // Create a new transaction with messages and file writes
+//! let nonce = agent_data
+//!     .next_transaction(&context_manager)
+//!     .message(claudius::MessageParam::user("Hello, world!"))
+//!     .save()
+//!     .await?;
+//!
+//! println!("Transaction persisted with nonce: {}", nonce);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Architecture
+//!
+//! CETK organizes agent state into a hierarchy:
+//!
+//! ```text
+//! Agent
+//! └── Context (logical conversation grouping)
+//!     └── Transaction (atomic state change)
+//!         ├── Messages (conversation history)
+//!         └── File Writes (virtual filesystem changes)
+//! ```
+//!
+//! Each level provides different durability and semantic guarantees, allowing for
+//! flexible agent memory management and context switching.
+//!
+//! ## Type System
+//!
+//! CETK uses strongly-typed IDs to prevent mixing of different entity types:
+//!
+//! - [`AgentID`]: Identifies individual agents
+//! - [`ContextID`]: Identifies conversation contexts
+//! - [`TransactionID`]: Identifies atomic state changes
+//! - [`MountID`]: Identifies virtual filesystem mounts
+//!
+//! All IDs are UUID-based with human-readable prefixes for debugging.
 
 use one_two_eight::generate_id;
 
@@ -21,11 +90,19 @@ pub use transaction::{
 
 ///////////////////////////////////////////// Constants ////////////////////////////////////////////
 
+/// Maximum size in bytes for serialized transaction data before chunking is required.
+///
+/// This limit ensures that individual chunks remain manageable for storage and network
+/// transmission. When a transaction's serialized size exceeds this limit, it will be
+/// automatically split into multiple chunks for storage and later reassembled on retrieval.
 pub const CHUNK_SIZE_LIMIT: usize = 8192;
 
-///////////////////////////////////////// generate_id_serde ////////////////////////////////////////
+//////////////////////////////////////////// ID Macros ///////////////////////////////////////////
 
 /// Generate the serde Deserialize/Serialize routines for a one_two_eight ID.
+///
+/// This macro implements the necessary traits for ID types to work with serde serialization,
+/// tuple_key encoding, and ChromaDB metadata storage.
 macro_rules! generate_id_crate {
     ($name:ident, $visitor:ident) => {
         impl tuple_key::Element for $name {

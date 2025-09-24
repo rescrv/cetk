@@ -1,3 +1,87 @@
+//! Transaction data structures and processing.
+//!
+//! This module provides the core transaction system for CETK, including:
+//!
+//! - **Atomic Transactions**: [`Transaction`] represents atomic units of agent state changes
+//! - **Chunking System**: Automatic splitting of large transactions for storage efficiency
+//! - **Virtual File Operations**: [`FileWrite`] for virtual filesystem modifications
+//! - **Invariant Checking**: Built-in validation to ensure data integrity
+//!
+//! ## Transaction Structure
+//!
+//! A [`Transaction`] contains:
+//! - Agent, context, and transaction identifiers for hierarchy management
+//! - Conversation messages that extend the agent's dialogue history
+//! - File system writes that modify virtual filesystem state
+//!
+//! ## Size Management
+//!
+//! Large transactions are automatically split into [`TransactionChunk`]s when they exceed
+//! [`CHUNK_SIZE_LIMIT`]. This ensures efficient storage and retrieval while maintaining
+//! atomicity guarantees through proper reassembly.
+//!
+//! ## Examples
+//!
+//! ### Creating a Transaction
+//!
+//! ```rust
+//! use cetk::{Transaction, AgentID, FileWrite, MountID};
+//! use claudius::{MessageParam, MessageRole};
+//!
+//! let agent_id = AgentID::generate().unwrap();
+//! let mount_id = MountID::generate().unwrap();
+//!
+//! let transaction = Transaction {
+//!     agent_id,
+//!     context_seq_no: 1,
+//!     transaction_seq_no: 1,
+//!     msgs: vec![
+//!         MessageParam::user("Hello"),
+//!         MessageParam::assistant("Hi there!"),
+//!     ],
+//!     writes: vec![FileWrite {
+//!         mount: mount_id,
+//!         path: "/notes.txt".to_string(),
+//!         data: "Meeting notes...".to_string(),
+//!     }],
+//! };
+//!
+//! // Validate transaction invariants
+//! transaction.check_invariants().unwrap();
+//! ```
+//!
+//! ### Chunking Large Transactions
+//!
+//! ```rust
+//! use cetk::{Transaction, CHUNK_SIZE_LIMIT};
+//!
+//! # fn example() -> Result<(), cetk::TransactionSerializationError> {
+//! # let transaction = Transaction::default();
+//! // Transactions exceeding CHUNK_SIZE_LIMIT are automatically chunked
+//! let chunks = transaction.chunk_transaction()?;
+//!
+//! // Chunks can be reassembled back to the original transaction
+//! let reassembled = Transaction::from_chunks(chunks).unwrap();
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Error Types
+//!
+//! The module provides comprehensive error types for different failure scenarios:
+//!
+//! - [`TransactionSerializationError`]: JSON serialization failures
+//! - [`FromChunksError`]: Chunk reassembly failures
+//! - [`ChunkSizeExceededError`]: Individual item size violations
+//! - [`InvariantViolation`]: Data integrity violations
+//!
+//! ## Invariant Checking
+//!
+//! Transactions automatically validate:
+//! - File write sizes don't exceed chunk limits
+//! - Messages don't have consecutive duplicate roles (conversation flow)
+//! - All required fields are properly populated
+
 use claudius::{MessageParam, MessageRole};
 
 use crate::{AgentID, CHUNK_SIZE_LIMIT, MountID};
@@ -7,10 +91,15 @@ use crate::{AgentID, CHUNK_SIZE_LIMIT, MountID};
 /// Error that occurs during transaction serialization operations.
 #[derive(Debug)]
 pub struct TransactionSerializationError {
+    /// The agent ID associated with the failed serialization
     pub agent_id: AgentID,
+    /// The context sequence number where serialization failed
     pub context_seq_no: u32,
+    /// The transaction sequence number where serialization failed
     pub transaction_seq_no: u64,
+    /// Description of the operation that failed
     pub operation: String,
+    /// The underlying JSON serialization error
     pub error: serde_json::Error,
 }
 
@@ -37,39 +126,61 @@ pub enum FromChunksError {
     NoChunks,
     /// Chunks belong to different transactions.
     MismatchedTransaction {
+        /// The expected agent ID
         agent_id: AgentID,
+        /// The expected context sequence number
         context_seq_no: u32,
+        /// The expected transaction sequence number
         transaction_seq_no: u64,
     },
     /// Missing chunks in the sequence.
     MissingChunks {
+        /// The agent ID for the incomplete transaction
         agent_id: AgentID,
+        /// The context sequence number for the incomplete transaction
         context_seq_no: u32,
+        /// The transaction sequence number for the incomplete transaction
         transaction_seq_no: u64,
+        /// The expected number of chunks
         expected: u32,
+        /// The actual number of chunks received
         actual: u32,
     },
     /// Extra chunks beyond what total_chunks indicates.
     ExtraChunks {
+        /// The agent ID for the transaction with extra chunks
         agent_id: AgentID,
+        /// The context sequence number for the transaction with extra chunks
         context_seq_no: u32,
+        /// The transaction sequence number for the transaction with extra chunks
         transaction_seq_no: u64,
+        /// The expected number of chunks
         expected: u32,
+        /// The actual number of chunks received
         actual: u32,
     },
     /// Chunk sequence numbers are not consecutive.
     InvalidSequence {
+        /// The agent ID for the transaction with invalid sequence
         agent_id: AgentID,
+        /// The context sequence number for the transaction with invalid sequence
         context_seq_no: u32,
+        /// The transaction sequence number for the transaction with invalid sequence
         transaction_seq_no: u64,
+        /// The expected chunk sequence number
         expected: u32,
+        /// The actual chunk sequence number found
         actual: u32,
     },
     /// Failed to deserialize the reconstructed data.
     Deserialization {
+        /// The agent ID for the failed deserialization
         agent_id: AgentID,
+        /// The context sequence number for the failed deserialization
         context_seq_no: u32,
+        /// The transaction sequence number for the failed deserialization
         transaction_seq_no: u64,
+        /// The underlying deserialization error
         error: serde_json::Error,
     },
 }
@@ -156,8 +267,11 @@ impl std::error::Error for FromChunksError {
 /// Error indicating that an item exceeds the maximum chunk size.
 #[derive(Debug)]
 pub struct ChunkSizeExceededError {
+    /// Description of the type of item that exceeded the limit
     pub item_type: String,
+    /// The actual size in bytes of the oversized item
     pub actual_size: usize,
+    /// The maximum allowed size limit in bytes
     pub limit: usize,
 }
 
@@ -181,10 +295,15 @@ pub enum InvariantViolation {
     /// Two consecutive messages have the same role, which violates conversation flow.
     /// This typically indicates a problem with message sequencing or role assignment.
     ConsecutiveMessagesWithSameRole {
+        /// The agent ID where the violation occurred
         agent_id: AgentID,
+        /// The context sequence number where the violation occurred
         context_seq_no: u32,
+        /// The transaction sequence number where the violation occurred
         transaction_seq_no: u64,
+        /// The role that appears consecutively
         role: MessageRole,
+        /// The positions (indices) of the consecutive messages with same role
         positions: (usize, usize),
     },
 }
@@ -224,12 +343,46 @@ impl std::error::Error for InvariantViolation {
 /// A Transaction contains a transaction ID, some application data (usually a pointer to the
 /// application state elsewhere, but it could be a state transition for rolling up in a state
 /// machine), some messages to append to the conversation, and some filesystem writes.
+///
+/// Transactions represent atomic units of work within an agent's context. Each transaction
+/// is uniquely identified by its agent_id, context_seq_no, and transaction_seq_no.
+/// Transactions can be chunked if they exceed size limits and later reassembled.
+///
+/// # Examples
+///
+/// ```rust
+/// use cetk::{Transaction, AgentID, FileWrite, MountID};
+/// use claudius::{MessageParam, MessageRole};
+///
+/// let agent_id = AgentID::generate().unwrap();
+/// let mount_id = MountID::generate().unwrap();
+///
+/// let transaction = Transaction {
+///     agent_id,
+///     context_seq_no: 1,
+///     transaction_seq_no: 1,
+///     msgs: vec![MessageParam {
+///         role: MessageRole::User,
+///         content: "Hello".into(),
+///     }],
+///     writes: vec![FileWrite {
+///         mount: mount_id,
+///         path: "/test.txt".to_string(),
+///         data: "test content".to_string(),
+///     }],
+/// };
+/// ```
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct Transaction {
+    /// The unique identifier of the agent that created this transaction
     pub agent_id: AgentID,
+    /// The sequence number of the context containing this transaction
     pub context_seq_no: u32,
+    /// The sequence number of this transaction within its context
     pub transaction_seq_no: u64,
+    /// Messages to be added to the conversation as part of this transaction
     pub msgs: Vec<MessageParam>,
+    /// File system writes to be performed as part of this transaction
     pub writes: Vec<FileWrite>,
 }
 
@@ -445,13 +598,26 @@ impl Transaction {
 ///////////////////////////////////////// TransactionChunk /////////////////////////////////////////
 
 /// A chunk of a transaction when it exceeds the storage size limit.
+///
+/// When a transaction's serialized representation exceeds [`CHUNK_SIZE_LIMIT`],
+/// it is split into multiple chunks for storage. Each chunk contains part of the
+/// serialized transaction data along with metadata needed for reassembly.
+///
+/// Chunks are identified by their sequence number within the transaction and
+/// can be reassembled in the correct order to reconstruct the original transaction.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct TransactionChunk {
+    /// The agent ID that owns this transaction chunk
     pub agent_id: AgentID,
+    /// The context sequence number this chunk belongs to
     pub context_seq_no: u32,
+    /// The transaction sequence number this chunk belongs to
     pub transaction_seq_no: u64,
+    /// The sequence number of this chunk within the transaction (0-based)
     pub chunk_seq_no: u32,
+    /// The total number of chunks for the complete transaction
     pub total_chunks: u32,
+    /// The serialized data contained in this chunk
     pub data: String,
 }
 
@@ -459,11 +625,29 @@ pub struct TransactionChunk {
 
 /// Write the complete contents of data to the file at path on mount.
 ///
-/// We assume files in the virtual filesystem should be small.
+/// We assume files in the virtual filesystem should be small. FileWrites represent
+/// complete overwrites of file content - they are not incremental patches but rather
+/// full replacements of the file's contents.
+///
+/// # Examples
+///
+/// ```rust
+/// use cetk::{FileWrite, MountID};
+///
+/// let mount_id = MountID::generate().unwrap();
+/// let write = FileWrite {
+///     mount: mount_id,
+///     path: "/config/settings.json".to_string(),
+///     data: r#"{"theme": "dark", "autosave": true}"#.to_string(),
+/// };
+/// ```
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct FileWrite {
+    /// The mount identifier where the file should be written
     pub mount: MountID,
+    /// The absolute path to the file within the mount
     pub path: String,
+    /// The complete file content to write
     pub data: String,
 }
 

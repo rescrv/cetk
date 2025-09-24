@@ -1,3 +1,13 @@
+//! Text embedding functionality for the Context Engineer's Toolkit.
+//!
+//! This module provides text embedding capabilities using the sentence-transformers/all-MiniLM-L6-v2
+//! model for generating vector embeddings from text. These embeddings are used by ChromaDB for
+//! semantic search and retrieval of transaction data.
+//!
+//! The module provides two main types:
+//! - [`EmbeddingModel`]: A low-level interface to the BERT embedding model
+//! - [`EmbeddingService`]: A high-level shared service for generating embeddings
+
 use anyhow::Result;
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
@@ -6,7 +16,27 @@ use hf_hub::{Repo, RepoType, api::sync::Api};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
-/// Embedding model for generating vector embeddings from text using sentence-transformers/all-MiniLM-L6-v2
+/// Embedding model for generating vector embeddings from text using sentence-transformers/all-MiniLM-L6-v2.
+///
+/// This struct encapsulates a BERT-based transformer model that converts text strings into
+/// high-dimensional vectors (embeddings). The model produces 384-dimensional embeddings
+/// that capture semantic meaning and can be used for similarity search and retrieval.
+///
+/// The model runs on CPU for simplicity and compatibility, though GPU support could be
+/// added in the future for improved performance.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use cetk::EmbeddingModel;
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// let model = EmbeddingModel::new()?;
+/// let embedding = model.embed_single("Hello, world!")?;
+/// assert_eq!(embedding.len(), 384); // all-MiniLM-L6-v2 produces 384-dimensional embeddings
+/// # Ok(())
+/// # }
+/// ```
 pub struct EmbeddingModel {
     model: BertModel,
     tokenizer: Tokenizer,
@@ -14,7 +44,30 @@ pub struct EmbeddingModel {
 }
 
 impl EmbeddingModel {
-    /// Create a new EmbeddingModel using sentence-transformers/all-MiniLM-L6-v2
+    /// Create a new EmbeddingModel using sentence-transformers/all-MiniLM-L6-v2.
+    ///
+    /// This constructor downloads the pre-trained model and tokenizer from Hugging Face Hub
+    /// if they are not already cached locally. The model files include:
+    /// - `config.json`: Model configuration
+    /// - `tokenizer.json`: Tokenizer configuration
+    /// - `pytorch_model.bin`: Model weights
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Network connection to Hugging Face Hub fails
+    /// - Model files cannot be downloaded or read
+    /// - Model weights cannot be loaded
+    /// - Device initialization fails
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use cetk::EmbeddingModel;
+    ///
+    /// let model = EmbeddingModel::new()?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
     pub fn new() -> Result<Self> {
         let device = Device::Cpu; // Use CPU for simplicity, could add GPU support later
 
@@ -55,7 +108,44 @@ impl EmbeddingModel {
         })
     }
 
-    /// Generate embeddings for a batch of texts
+    /// Generate embeddings for a batch of texts.
+    ///
+    /// This method processes multiple text strings in a single forward pass,
+    /// which is more efficient than processing them individually. Each text
+    /// is tokenized, padded to the same length, and then processed by the model.
+    ///
+    /// The resulting embeddings are normalized and have 384 dimensions each.
+    ///
+    /// # Arguments
+    ///
+    /// * `texts` - A slice of string slices to generate embeddings for
+    ///
+    /// # Returns
+    ///
+    /// A vector of embeddings, where each embedding is a vector of 384 f32 values.
+    /// The order of embeddings corresponds to the order of input texts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Tokenization fails
+    /// - Model inference fails
+    /// - Tensor operations fail
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use cetk::EmbeddingModel;
+    ///
+    /// # fn example() -> anyhow::Result<()> {
+    /// let model = EmbeddingModel::new()?;
+    /// let texts = ["First text", "Second text"];
+    /// let embeddings = model.embed(&texts)?;
+    /// assert_eq!(embeddings.len(), 2);
+    /// assert_eq!(embeddings[0].len(), 384);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
@@ -100,7 +190,38 @@ impl EmbeddingModel {
         Ok(embeddings)
     }
 
-    /// Generate a single embedding for one text
+    /// Generate a single embedding for one text.
+    ///
+    /// This is a convenience method that calls [`embed`](Self::embed) with a single text
+    /// and extracts the first result. For processing multiple texts, prefer using
+    /// [`embed`](Self::embed) directly as it's more efficient.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - The text string to generate an embedding for
+    ///
+    /// # Returns
+    ///
+    /// A 384-dimensional embedding vector as f32 values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The embedding generation fails
+    /// - No embedding is produced (should not happen in normal operation)
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use cetk::EmbeddingModel;
+    ///
+    /// # fn example() -> anyhow::Result<()> {
+    /// let model = EmbeddingModel::new()?;
+    /// let embedding = model.embed_single("Hello, world!")?;
+    /// assert_eq!(embedding.len(), 384);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn embed_single(&self, text: &str) -> Result<Vec<f32>> {
         let embeddings = self.embed(&[text])?;
         embeddings
@@ -110,24 +231,115 @@ impl EmbeddingModel {
     }
 }
 
-/// Shared embedding model instance
+/// Shared embedding model instance.
+///
+/// EmbeddingService provides a thread-safe, shared interface to an embedding model.
+/// It wraps an [`EmbeddingModel`] in an [`Arc`] for efficient sharing across multiple
+/// contexts without duplicating the heavyweight model resources.
+///
+/// This is the preferred interface for using embeddings in applications that need
+/// to share the model across multiple threads or components.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use cetk::EmbeddingService;
+///
+/// # fn example() -> anyhow::Result<()> {
+/// let service = EmbeddingService::new()?;
+/// let embedding = service.embed_single("Hello, world!")?;
+/// assert_eq!(embedding.len(), 384);
+/// # Ok(())
+/// # }
+/// ```
 pub struct EmbeddingService {
     model: Arc<EmbeddingModel>,
 }
 
 impl EmbeddingService {
-    /// Create a new embedding service
+    /// Create a new embedding service.
+    ///
+    /// This creates a new [`EmbeddingModel`] and wraps it in an [`Arc`] for efficient
+    /// sharing. The model is initialized with the sentence-transformers/all-MiniLM-L6-v2
+    /// weights from Hugging Face Hub.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying [`EmbeddingModel::new`] fails, which can
+    /// happen if:
+    /// - Network connection to Hugging Face Hub fails
+    /// - Model files cannot be downloaded or read
+    /// - Model weights cannot be loaded
+    /// - Device initialization fails
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use cetk::EmbeddingService;
+    ///
+    /// let service = EmbeddingService::new()?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
     pub fn new() -> Result<Self> {
         let model = Arc::new(EmbeddingModel::new()?);
         Ok(EmbeddingService { model })
     }
 
-    /// Generate embeddings for a batch of texts
+    /// Generate embeddings for a batch of texts.
+    ///
+    /// This method delegates to the underlying [`EmbeddingModel::embed`] method.
+    /// See that method for detailed documentation on behavior, arguments, and errors.
+    ///
+    /// # Arguments
+    ///
+    /// * `texts` - A slice of string slices to generate embeddings for
+    ///
+    /// # Returns
+    ///
+    /// A vector of 384-dimensional embeddings, one for each input text.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use cetk::EmbeddingService;
+    ///
+    /// # fn example() -> anyhow::Result<()> {
+    /// let service = EmbeddingService::new()?;
+    /// let texts = ["First text", "Second text"];
+    /// let embeddings = service.embed(&texts)?;
+    /// assert_eq!(embeddings.len(), 2);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         self.model.embed(texts)
     }
 
-    /// Generate a single embedding for one text
+    /// Generate a single embedding for one text.
+    ///
+    /// This method delegates to the underlying [`EmbeddingModel::embed_single`] method.
+    /// See that method for detailed documentation on behavior, arguments, and errors.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - The text string to generate an embedding for
+    ///
+    /// # Returns
+    ///
+    /// A 384-dimensional embedding vector.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use cetk::EmbeddingService;
+    ///
+    /// # fn example() -> anyhow::Result<()> {
+    /// let service = EmbeddingService::new()?;
+    /// let embedding = service.embed_single("Hello, world!")?;
+    /// assert_eq!(embedding.len(), 384);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn embed_single(&self, text: &str) -> Result<Vec<f32>> {
         self.model.embed_single(text)
     }

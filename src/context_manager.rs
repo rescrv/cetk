@@ -1,3 +1,89 @@
+//! Context management and agent state persistence.
+//!
+//! This module provides the core context management functionality for CETK, including:
+//!
+//! - **Agent State Management**: Loading and persisting complete agent histories
+//! - **Transaction Building**: Fluent API for creating and persisting transactions
+//! - **Virtual Filesystems**: File operations within agent contexts
+//! - **ChromaDB Integration**: Vector storage and retrieval of agent data
+//!
+//! ## Core Types
+//!
+//! - [`ContextManager`]: Central coordinator for agent persistence operations
+//! - [`AgentData`]: Complete agent state with all contexts and transactions
+//! - [`AgentContext`]: Logical grouping of related transactions
+//! - [`TransactionBuilder`]: Fluent interface for transaction construction
+//!
+//! ## Usage Patterns
+//!
+//! ### Basic Agent Operations
+//!
+//! ```rust,no_run
+//! use cetk::{ContextManager, AgentID};
+//! use chromadb::ChromaClient;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Setup
+//! let client = ChromaClient::new(chromadb::client::ChromaClientOptions::default()).await?;
+//! let collection = client.get_or_create_collection("agents", None, None).await?;
+//! let context_manager = ContextManager::new(collection)?;
+//!
+//! let agent_id = AgentID::generate().unwrap();
+//!
+//! // Load existing agent or create new
+//! let mut agent_data = context_manager.load_agent(agent_id).await?;
+//!
+//! // Add a new transaction
+//! let nonce = agent_data
+//!     .next_transaction(&context_manager)
+//!     .message(claudius::MessageParam::user("Hello!"))
+//!     .save()
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ### File System Operations
+//!
+//! ```rust,no_run
+//! use cetk::{ContextManager, AgentID, MountID};
+//!
+//! # async fn example(context_manager: ContextManager, mut agent_data: cetk::AgentData) -> anyhow::Result<()> {
+//! let mount_id = MountID::generate().unwrap();
+//!
+//! // Write files and search content
+//! let _nonce = agent_data
+//!     .next_transaction(&context_manager)
+//!     .write_file(mount_id, "/notes.txt", "Important notes here")
+//!     .unwrap()
+//!     .write_file(mount_id, "/config.json", r#"{"theme": "dark"}"#)
+//!     .unwrap()
+//!     .save()
+//!     .await?;
+//!
+//! // Search file contents
+//! let matches = agent_data.search_file_contents(mount_id, "Important")?;
+//! println!("Found {} matching files", matches.len());
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Error Handling
+//!
+//! All operations that can fail return [`ContextManagerError`] which provides detailed
+//! error information including the specific operation that failed and underlying causes.
+//!
+//! ## Concurrency and Atomicity
+//!
+//! The [`ContextManager`] ensures atomic persistence of transactions through:
+//!
+//! - Chunk-based storage for large transactions
+//! - Nonce-based verification of successful persistence
+//! - Automatic transaction reassembly from chunks
+//!
+//! Individual transactions are atomic, but concurrent access to the same agent
+//! should be coordinated by the application layer.
+
 use std::collections::HashMap;
 
 use chromadb::{
@@ -102,7 +188,10 @@ impl From<anyhow::Error> for ContextManagerError {
 
 //////////////////////////////////////// Helper Functions /////////////////////////////////////////
 
-/// Extract a string field from ChromaDB metadata with error handling
+/// Extract a string field from ChromaDB metadata with error handling.
+///
+/// This helper function safely extracts string values from ChromaDB metadata,
+/// providing detailed error messages when fields are missing or have incorrect types.
 fn extract_metadata_string(
     metadata: &HashMap<String, MetadataValue>,
     field_name: &str,
@@ -122,7 +211,10 @@ fn extract_metadata_string(
         })
 }
 
-/// Extract a u32 field from ChromaDB metadata with error handling
+/// Extract a u32 field from ChromaDB metadata with error handling.
+///
+/// This helper function safely extracts u32 values from ChromaDB metadata,
+/// converting from i64 storage format and providing detailed error messages.
 fn extract_metadata_u32(
     metadata: &HashMap<String, MetadataValue>,
     field_name: &str,
@@ -142,7 +234,10 @@ fn extract_metadata_u32(
         })
 }
 
-/// Extract a u64 field from ChromaDB metadata with error handling
+/// Extract a u64 field from ChromaDB metadata with error handling.
+///
+/// This helper function safely extracts u64 values from ChromaDB metadata,
+/// converting from i64 storage format and providing detailed error messages.
 fn extract_metadata_u64(
     metadata: &HashMap<String, MetadataValue>,
     field_name: &str,
@@ -162,7 +257,18 @@ fn extract_metadata_u64(
         })
 }
 
-/// Validates a file path for security and correctness
+/// Validates a file path for security and correctness.
+///
+/// This function performs comprehensive validation to prevent:
+/// - Path traversal attacks ("../" sequences)
+/// - Null byte injection
+/// - Overly long paths (DoS prevention)
+/// - Invalid path formats
+///
+/// # Security
+///
+/// All file paths must start with "/" and cannot contain ".." to prevent
+/// access to files outside the virtual filesystem boundaries.
 fn validate_file_path(path: &str) -> Result<(), FileSystemError> {
     if path.is_empty() {
         return Err(FileSystemError::InvalidPath(
@@ -201,7 +307,16 @@ fn validate_file_path(path: &str) -> Result<(), FileSystemError> {
 }
 
 /// Generate a consistent chunk ID from transaction metadata.
-/// Format: agent_id:context_seq_no:transaction_seq_no:chunk_seq_no
+///
+/// Creates a unique identifier for each transaction chunk using a hierarchical
+/// format that enables efficient querying and sorting.
+///
+/// # Format
+///
+/// `agent_id:context_seq_no:transaction_seq_no:chunk_seq_no`
+///
+/// This format ensures that chunks sort naturally by agent, context, transaction,
+/// and chunk sequence, enabling efficient range queries in ChromaDB.
 fn generate_chunk_id(
     agent_id: AgentID,
     context_seq_no: u32,
@@ -214,8 +329,19 @@ fn generate_chunk_id(
     )
 }
 
-/// Search for the most recent file content in a collection of contexts
-/// Returns the content if found, None if not found
+/// Search for the most recent file content in a collection of contexts.
+///
+/// Traverses agent contexts in reverse chronological order to find the most
+/// recent write to a specific file path on a given mount.
+///
+/// # Returns
+///
+/// The content of the most recent file write, or `None` if the file was never written.
+///
+/// # Algorithm
+///
+/// Searches contexts from newest to oldest, then transactions within each context
+/// from newest to oldest, ensuring the most recent write is always found first.
 fn find_most_recent_file_content(
     contexts: &[AgentContext],
     mount: crate::MountID,
@@ -237,18 +363,48 @@ fn find_most_recent_file_content(
 
 //////////////////////////////////////// Agent Data Structures ////////////////////////////////////////
 
-/// Represents a complete context with its transactions for an agent
+/// Represents a complete context with its transactions for an agent.
+///
+/// A context is a logical grouping of related transactions within an agent's
+/// conversation or interaction history. Contexts provide a way to organize
+/// transactions into coherent sessions or conversation threads.
 #[derive(Debug, Clone)]
 pub struct AgentContext {
+    /// The unique identifier of the agent that owns this context
     pub agent_id: AgentID,
+    /// The sequence number that uniquely identifies this context
     pub context_seq_no: u32,
+    /// All transactions belonging to this context, ordered by sequence number
     pub transactions: Vec<Transaction>,
 }
 
-/// Complete agent data with all contexts and transactions
+/// Complete agent data with all contexts and transactions.
+///
+/// This structure represents the full persistent state for an agent,
+/// containing all of its contexts and the transactions within each context.
+/// It provides methods for navigating, querying, and building upon the
+/// agent's interaction history.
+///
+/// # Examples
+///
+/// ```rust
+/// use cetk::{AgentData, AgentID};
+///
+/// let agent_id = AgentID::generate().unwrap();
+/// let agent_data = AgentData {
+///     agent_id,
+///     contexts: Vec::new(),
+/// };
+///
+/// // Get the latest context
+/// let latest = agent_data.latest_context();
+/// assert!(latest.is_none()); // No contexts yet
+/// ```
 #[derive(Debug, Clone)]
 pub struct AgentData {
+    /// The unique identifier of the agent
     pub agent_id: AgentID,
+    /// All contexts for this agent, ordered by sequence number
     pub contexts: Vec<AgentContext>,
 }
 
