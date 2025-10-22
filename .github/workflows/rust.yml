@@ -19,6 +19,7 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-
+    - uses: arduino/setup-protoc@v3
     - name: cargo clippy
       run: cargo clippy --all-targets -- -D clippy::all -D warnings
     - name: cargo test
