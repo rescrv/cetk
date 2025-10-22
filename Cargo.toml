@@ -2,6 +2,8 @@
 name = "cetk"
 version = "0.1.0"
 edition = "2024"
+description = "The context-engineer's toolkit"
+license = "Apache-2.0"
 
 [dependencies]
 chrono = { version = "0.4.39", features = ["clock", "serde"] }
