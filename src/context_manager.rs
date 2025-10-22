@@ -5,7 +5,7 @@
 //! - **Agent State Management**: Loading and persisting complete agent histories
 //! - **Transaction Building**: Fluent API for creating and persisting transactions
 //! - **Virtual Filesystems**: File operations within agent contexts
-//! - **ChromaDB Integration**: Vector storage and retrieval of agent data
+//! - **Chroma Integration**: Vector storage and retrieval of agent data
 //!
 //! ## Core Types
 //!
@@ -20,11 +20,11 @@
 //!
 //! ```rust,no_run
 //! use cetk::{ContextManager, AgentID};
-//! use chromadb::ChromaClient;
+//! use chroma::ChromaHttpClient;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Setup
-//! let client = ChromaClient::new(chromadb::client::ChromaClientOptions::default()).await?;
+//! let client = ChromaHttpClient::cloud()?;
 //! let collection = client.get_or_create_collection("agents", None, None).await?;
 //! let context_manager = ContextManager::new(collection)?;
 //!
@@ -86,10 +86,12 @@
 
 use std::collections::HashMap;
 
-use chromadb::{
-    MetadataValue,
-    collection::{ChromaCollection, CollectionEntries, GetOptions},
-    filters,
+use chroma::{
+    types::{
+        GetResponse, Include, IncludeList, Metadata, MetadataComparison, MetadataExpression,
+        MetadataValue, PrimitiveOperator, Where,
+    },
+    ChromaCollection,
 };
 
 use crate::{AgentID, EmbeddingService, FileWrite, Transaction, TransactionChunk, TransactionID};
@@ -100,7 +102,7 @@ use claudius::MessageParam;
 /// Error that can occur during context management operations.
 #[derive(Debug)]
 pub enum ContextManagerError {
-    /// Error connecting to or communicating with ChromaDB.
+    /// Error connecting to or communicating with Chroma.
     ChromaError(String),
     /// Error chunking the transaction.
     ChunkingError(crate::TransactionSerializationError),
@@ -149,7 +151,7 @@ impl From<FileSystemError> for ContextManagerError {
 impl std::fmt::Display for ContextManagerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ContextManagerError::ChromaError(e) => write!(f, "ChromaDB error: {}", e),
+            ContextManagerError::ChromaError(e) => write!(f, "Chroma error: {}", e),
             ContextManagerError::ChunkingError(e) => {
                 write!(f, "Transaction chunking error: {}", e)
             }
@@ -188,9 +190,9 @@ impl From<anyhow::Error> for ContextManagerError {
 
 //////////////////////////////////////// Helper Functions /////////////////////////////////////////
 
-/// Extract a string field from ChromaDB metadata with error handling.
+/// Extract a string field from Chroma metadata with error handling.
 ///
-/// This helper function safely extracts string values from ChromaDB metadata,
+/// This helper function safely extracts string values from Chroma metadata,
 /// providing detailed error messages when fields are missing or have incorrect types.
 fn extract_metadata_string(
     metadata: &HashMap<String, MetadataValue>,
@@ -211,9 +213,9 @@ fn extract_metadata_string(
         })
 }
 
-/// Extract a u32 field from ChromaDB metadata with error handling.
+/// Extract a u32 field from Chroma metadata with error handling.
 ///
-/// This helper function safely extracts u32 values from ChromaDB metadata,
+/// This helper function safely extracts u32 values from Chroma metadata,
 /// converting from i64 storage format and providing detailed error messages.
 fn extract_metadata_u32(
     metadata: &HashMap<String, MetadataValue>,
@@ -234,9 +236,9 @@ fn extract_metadata_u32(
         })
 }
 
-/// Extract a u64 field from ChromaDB metadata with error handling.
+/// Extract a u64 field from Chroma metadata with error handling.
 ///
-/// This helper function safely extracts u64 values from ChromaDB metadata,
+/// This helper function safely extracts u64 values from Chroma metadata,
 /// converting from i64 storage format and providing detailed error messages.
 fn extract_metadata_u64(
     metadata: &HashMap<String, MetadataValue>,
@@ -316,7 +318,7 @@ fn validate_file_path(path: &str) -> Result<(), FileSystemError> {
 /// `agent_id:context_seq_no:transaction_seq_no:chunk_seq_no`
 ///
 /// This format ensures that chunks sort naturally by agent, context, transaction,
-/// and chunk sequence, enabling efficient range queries in ChromaDB.
+/// and chunk sequence, enabling efficient range queries in Chroma.
 fn generate_chunk_id(
     agent_id: AgentID,
     context_seq_no: u32,
@@ -327,6 +329,16 @@ fn generate_chunk_id(
         "{}:{}:{}:{}",
         agent_id, context_seq_no, transaction_seq_no, chunk_seq_no
     )
+}
+
+fn metadata_equals(
+    key: impl Into<String>,
+    value: impl Into<MetadataValue>,
+) -> Where {
+    Where::Metadata(MetadataExpression {
+        key: key.into(),
+        comparison: MetadataComparison::Primitive(PrimitiveOperator::Equal, value.into()),
+    })
 }
 
 /// Search for the most recent file content in a collection of contexts.
@@ -788,18 +800,18 @@ impl<'a> TransactionBuilder<'a> {
         summary
     }
 
-    /// Complete the transaction builder and persist it to ChromaDB.
+    /// Complete the transaction builder and persist it to Chroma.
     ///
     /// This will:
     /// 1. Build the Transaction struct
-    /// 2. Persist it to ChromaDB with verification
+    /// 2. Persist it to Chroma with verification
     /// 3. Update the AgentData with the new transaction
     /// 4. Return the persistence nonce
     pub async fn save(mut self) -> Result<String, ContextManagerError> {
         // Build the transaction
         let transaction = self.create_transaction();
 
-        // Persist to ChromaDB
+        // Persist to Chroma
         let nonce = self
             .context_manager
             .persist_transaction(&transaction)
@@ -848,7 +860,7 @@ impl<'a> TransactionBuilder<'a> {
 
 //////////////////////////////////////// ContextManager ////////////////////////////////////////
 
-/// Manages agent contexts and transaction persistence using ChromaDB collections.
+/// Manages agent contexts and transaction persistence using Chroma collections.
 ///
 /// The ContextManager handles:
 /// 1. Agent context management and transaction persistence
@@ -860,7 +872,7 @@ pub struct ContextManager {
 }
 
 impl ContextManager {
-    /// Create a new ContextManager with a ChromaDB collection.
+    /// Create a new ContextManager with a Chroma collection.
     pub fn new(collection: ChromaCollection) -> Result<Self, ContextManagerError> {
         let embedding_service = EmbeddingService::new()?;
         Ok(ContextManager {
@@ -898,13 +910,11 @@ impl ContextManager {
             })
             .collect();
 
-        let chunk_id_refs: Vec<&str> = chunk_ids.iter().map(|s| s.as_str()).collect();
-
         // Create metadata with the nonce for each chunk
-        let metadatas: Vec<HashMap<String, MetadataValue>> = chunks
+        let metadatas: Vec<Metadata> = chunks
             .iter()
             .map(|chunk| {
-                let mut metadata = HashMap::new();
+                let mut metadata: Metadata = HashMap::new();
                 metadata.insert("nonce".to_string(), MetadataValue::Str(nonce.clone()));
                 metadata.insert(
                     "agent_id".to_string(),
@@ -929,23 +939,21 @@ impl ContextManager {
                 metadata
             })
             .collect();
+        let metadata_entries: Vec<Option<Metadata>> =
+            metadatas.into_iter().map(Some).collect();
 
         // Create documents from chunk data
-        let documents: Vec<&str> = chunks.iter().map(|chunk| chunk.data.as_str()).collect();
+        let document_texts: Vec<String> = chunks.iter().map(|chunk| chunk.data.clone()).collect();
+        let document_refs: Vec<&str> = document_texts.iter().map(|doc| doc.as_str()).collect();
 
         // Generate real embeddings for each chunk using the embedding service
-        let embeddings = self.embedding_service.embed(&documents)?;
-
-        let collection_entries = CollectionEntries {
-            ids: chunk_id_refs,
-            metadatas: Some(metadatas),
-            documents: Some(documents),
-            embeddings: Some(embeddings),
-        };
+        let embeddings = self.embedding_service.embed(&document_refs)?;
+        let documents: Vec<Option<String>> =
+            document_texts.into_iter().map(Some).collect();
 
         // Atomically add all chunks to the collection
         self.collection
-            .add(collection_entries, None)
+            .add(chunk_ids, embeddings, Some(documents), None, Some(metadata_entries))
             .await
             .map_err(|e| ContextManagerError::ChromaError(e.to_string()))?;
 
@@ -977,13 +985,17 @@ impl ContextManager {
         );
 
         // Try to get chunk 0 from the collection
-        let get_options = chromadb::collection::GetOptions::new()
-            .ids(vec![chunk_0_id])
-            .include(vec!["metadatas".to_string()]);
+        let include = IncludeList(vec![Include::Metadata]);
 
         let result = self
             .collection
-            .get(get_options)
+            .get(
+                Some(vec![chunk_0_id]),
+                None,
+                Some(1),
+                Some(0),
+                Some(include),
+            )
             .await
             .map_err(|e| ContextManagerError::ChromaError(e.to_string()))?;
 
@@ -1006,42 +1018,44 @@ impl ContextManager {
     /// Load all transaction data for a given agent, organizing it by contexts and transactions.
     ///
     /// This method:
-    /// 1. Queries ChromaDB for all chunks belonging to the agent in batches (to handle 300 result limit)
+    /// 1. Queries Chroma for all chunks belonging to the agent in batches (to handle 300 result limit)
     /// 2. Groups chunks by context and transaction
     /// 3. Assembles complete transactions from their chunks
     /// 4. Returns organized agent data with contexts and transactions
     pub async fn load_agent(&self, agent_id: AgentID) -> Result<AgentData, ContextManagerError> {
         let mut all_chunks = Vec::new();
-        let batch_size = 300; // ChromaDB server-side limit
-        let mut offset = 0;
+        let batch_size: u32 = 300; // Chroma server-side limit
+        let mut offset: u32 = 0;
 
         loop {
             // Query chunks for this agent in batches
-            let agent_filter = filters::eq("agent_id", agent_id.to_string());
-            let get_options = GetOptions::new()
-                .where_metadata(agent_filter)
-                .limit(batch_size)
-                .offset(offset)
-                .include(vec!["metadatas".to_string(), "documents".to_string()]);
+            let agent_filter = metadata_equals("agent_id", agent_id.to_string());
+            let include = IncludeList(vec![Include::Metadata, Include::Document]);
 
             let result = self
                 .collection
-                .get(get_options)
+                .get(
+                    None,
+                    Some(agent_filter),
+                    Some(batch_size),
+                    Some(offset),
+                    Some(include),
+                )
                 .await
                 .map_err(|e| ContextManagerError::ChromaError(e.to_string()))?;
 
-            // Convert ChromaDB result to TransactionChunks
+            // Convert Chroma result to TransactionChunks
             let batch_chunks = self.convert_chroma_result_to_chunks(result)?;
 
             let batch_size_returned = batch_chunks.len();
             all_chunks.extend(batch_chunks);
 
             // If we got fewer results than requested, we've reached the end
-            if batch_size_returned < batch_size {
+            if batch_size_returned < batch_size as usize {
                 break;
             }
 
-            offset += batch_size;
+            offset = offset.saturating_add(batch_size);
         }
 
         // Organize chunks by context and transaction, then assemble
@@ -1050,12 +1064,12 @@ impl ContextManager {
         Ok(agent_data)
     }
 
-    /// Convert ChromaDB GetResult to TransactionChunks
+    /// Convert Chroma GetResponse to TransactionChunks
     fn convert_chroma_result_to_chunks(
         &self,
-        result: chromadb::collection::GetResult,
+        result: GetResponse,
     ) -> Result<Vec<TransactionChunk>, ContextManagerError> {
-        let chromadb::collection::GetResult {
+        let GetResponse {
             ids,
             metadatas,
             documents,
@@ -1064,13 +1078,13 @@ impl ContextManager {
 
         let Some(metadatas) = metadatas else {
             return Err(ContextManagerError::LoadAgentError(
-                "No metadata returned from ChromaDB".to_string(),
+                "No metadata returned from Chroma".to_string(),
             ));
         };
 
         let Some(documents) = documents else {
             return Err(ContextManagerError::LoadAgentError(
-                "No documents returned from ChromaDB".to_string(),
+                "No documents returned from Chroma".to_string(),
             ));
         };
 
@@ -1181,27 +1195,11 @@ impl ContextManager {
 mod tests {
     use super::*;
     use crate::AgentID;
-    use chromadb::ChromaClient;
+    use chroma::ChromaHttpClient;
     use claudius::{MessageParam, MessageRole};
 
-    async fn create_test_client() -> ChromaClient {
-        let mut options = chromadb::client::ChromaClientOptions::new()
-            .tenant(std::env::var("CHROMA_TENANT").unwrap_or("default_tenant".to_string()))
-            .database(std::env::var("CHROMA_DATABASE").unwrap_or("default_database".to_string()));
-
-        if let Ok(host) = std::env::var("CHROMA_HOST") {
-            options = options.url(host);
-        }
-
-        let options = if let Ok(api_key) = std::env::var("CHROMA_API_KEY") {
-            options.x_chroma_token(api_key)
-        } else {
-            options
-        };
-
-        ChromaClient::new(options)
-            .await
-            .expect("Failed to create ChromaDB client")
+    async fn create_test_client() -> ChromaHttpClient {
+        ChromaHttpClient::cloud().expect("Failed to construct Chroma client")
     }
 
     fn create_test_transaction() -> Transaction {
@@ -1222,7 +1220,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         ContextManager::new(collection).expect("Failed to create ContextManager")
     }
 
@@ -1266,7 +1264,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         let context_manager =
             ContextManager::new(collection).expect("Failed to create ContextManager");
 
@@ -1295,7 +1293,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         let context_manager =
             ContextManager::new(collection).expect("Failed to create ContextManager");
         let transaction = create_test_transaction();
@@ -1314,7 +1312,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         let context_manager =
             ContextManager::new(collection).expect("Failed to create ContextManager");
 
@@ -1367,7 +1365,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         let context_manager =
             ContextManager::new(collection).expect("Failed to create ContextManager");
 
@@ -1452,7 +1450,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         let context_manager =
             ContextManager::new(collection).expect("Failed to create ContextManager");
 
@@ -1499,7 +1497,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         let context_manager =
             ContextManager::new(collection).expect("Failed to create ContextManager");
 
@@ -1524,7 +1522,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         let context_manager =
             ContextManager::new(collection).expect("Failed to create ContextManager");
 
@@ -1570,7 +1568,7 @@ mod tests {
         assert_eq!(context.transactions[1].transaction_seq_no, 2);
         assert_eq!(context.transactions[1].msgs.len(), 1);
 
-        // Verify it was persisted to ChromaDB
+        // Verify it was persisted to Chroma
         let reloaded_data = context_manager.load_agent(agent_id).await.unwrap();
         assert_eq!(reloaded_data.contexts[0].transactions.len(), 2);
     }
@@ -1581,7 +1579,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         let context_manager =
             ContextManager::new(collection).expect("Failed to create ContextManager");
 
@@ -1627,7 +1625,7 @@ mod tests {
         assert_eq!(new_context.transactions.len(), 1);
         assert_eq!(new_context.transactions[0].transaction_seq_no, 1);
 
-        // Verify it was persisted to ChromaDB
+        // Verify it was persisted to Chroma
         let reloaded_data = context_manager.load_agent(agent_id).await.unwrap();
         assert_eq!(reloaded_data.contexts.len(), 2);
         assert_eq!(reloaded_data.contexts[1].context_seq_no, 2);
@@ -1639,7 +1637,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         let context_manager =
             ContextManager::new(collection).expect("Failed to create ContextManager");
 
@@ -1691,7 +1689,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         let context_manager =
             ContextManager::new(collection).expect("Failed to create ContextManager");
 
@@ -1749,7 +1747,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         let context_manager =
             ContextManager::new(collection).expect("Failed to create ContextManager");
 
@@ -1788,7 +1786,7 @@ mod tests {
         let collection = client
             .get_or_create_collection("test_transactions", None, None)
             .await
-            .expect("Failed to create ChromaDB collection");
+            .expect("Failed to create Chroma collection");
         let context_manager =
             ContextManager::new(collection).expect("Failed to create ContextManager");
 
@@ -1846,11 +1844,10 @@ mod tests {
     async fn agent_data_file_reading() {
         let client = create_test_client().await;
 
-        if let Err(e) = client.heartbeat().await {
-            println!("TODO(claude): cleanup this output");
-            println!("Skipping test - ChromaDB not available: {:?}", e);
-            return;
-        }
+        client
+            .heartbeat()
+            .await
+            .expect("Chroma heartbeat failed; ensure environment is configured");
 
         let collection_name = format!("test_agent_file_reading_{}", rand::random::<u32>());
         let collection = client
@@ -1913,11 +1910,10 @@ mod tests {
     async fn transaction_builder_filesystem_methods() {
         let client = create_test_client().await;
 
-        if let Err(e) = client.heartbeat().await {
-            println!("TODO(claude): cleanup this output");
-            println!("Skipping test - ChromaDB not available: {:?}", e);
-            return;
-        }
+        client
+            .heartbeat()
+            .await
+            .expect("Chroma heartbeat failed; ensure environment is configured");
 
         let collection_name = format!("test_builder_fs_{}", rand::random::<u32>());
         let collection = client
@@ -2009,11 +2005,10 @@ mod tests {
     async fn write_buffering_latest_wins() {
         let client = create_test_client().await;
 
-        if let Err(e) = client.heartbeat().await {
-            println!("TODO(claude): cleanup this output");
-            println!("Skipping test - ChromaDB not available: {:?}", e);
-            return;
-        }
+        client
+            .heartbeat()
+            .await
+            .expect("Chroma heartbeat failed; ensure environment is configured");
 
         let collection_name = format!("test_write_buffering_{}", rand::random::<u32>());
         let collection = client
@@ -2073,11 +2068,10 @@ mod tests {
     async fn multiple_writes_same_file_appears_once() {
         let client = create_test_client().await;
 
-        if let Err(e) = client.heartbeat().await {
-            println!("TODO(claude): cleanup this output");
-            println!("Skipping test - ChromaDB not available: {:?}", e);
-            return;
-        }
+        client
+            .heartbeat()
+            .await
+            .expect("Chroma heartbeat failed; ensure environment is configured");
 
         let collection_name = format!("test_multiple_writes_{}", rand::random::<u32>());
         let collection = client

@@ -1,7 +1,7 @@
 //! Text embedding functionality for the Context Engineer's Toolkit.
 //!
 //! This module provides text embedding capabilities using the sentence-transformers/all-MiniLM-L6-v2
-//! model for generating vector embeddings from text. These embeddings are used by ChromaDB for
+//! model for generating vector embeddings from text. These embeddings are used by Chroma for
 //! semantic search and retrieval of transaction data.
 //!
 //! The module provides two main types:

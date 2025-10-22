@@ -6,13 +6,13 @@
 //! - String replacement and content searching
 
 use cetk::{AgentID, ContextManager, MountID};
-use chromadb::ChromaClient;
+use chroma::ChromaHttpClient;
 use claudius::{MessageParam, MessageRole};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup ChromaDB connection
-    let client = ChromaClient::new(chromadb::client::ChromaClientOptions::default()).await?;
+    // Setup Chroma connection
+    let client = ChromaHttpClient::cloud()?;
     let collection = client
         .get_or_create_collection("context_example", None, None)
         .await?;

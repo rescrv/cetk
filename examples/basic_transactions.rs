@@ -1,18 +1,18 @@
 //! Basic transaction storage example
 //!
 //! This example shows how to:
-//! - Create and persist transactions to ChromaDB
+//! - Create and persist transactions to Chroma
 //! - Load agent data from storage
 //! - Build new transactions using the fluent API
 
 use cetk::{AgentData, AgentID, ContextManager, MountID};
-use chromadb::ChromaClient;
+use chroma::ChromaHttpClient;
 use claudius::{MessageParam, MessageRole};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Connect to ChromaDB
-    let client = ChromaClient::new(chromadb::client::ChromaClientOptions::default()).await?;
+    // Connect to Chroma
+    let client = ChromaHttpClient::cloud()?;
     let collection = client
         .get_or_create_collection("basic_example", None, None)
         .await?;

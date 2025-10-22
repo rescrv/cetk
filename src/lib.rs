@@ -4,12 +4,12 @@
 //! # Context Engineer's Toolkit (CETK)
 //!
 //! CETK is a batteries-included framework for building long-lived, persistent agents with
-//! durable state, virtual filesystems, and semantic memory. It integrates with ChromaDB
+//! durable state, virtual filesystems, and semantic memory. It integrates with Chroma
 //! for vector storage and provides transactional guarantees for agent state management.
 //!
 //! ## Core Capabilities
 //!
-//! - **Durability**: Persist agent conversation history and state in ChromaDB with transactional guarantees
+//! - **Durability**: Persist agent conversation history and state in Chroma with transactional guarantees
 //! - **Virtual Filesystems**: Mount-based virtual filesystems for agent file operations
 //! - **Context Management**: Hierarchical contexts with compaction and point-in-time restore
 //! - **Semantic Memory**: Both perfect memory (full history traversal) and fast memory (vector similarity)
@@ -19,11 +19,11 @@
 //!
 //! ```rust,no_run
 //! use cetk::{ContextManager, AgentID};
-//! use chromadb::ChromaClient;
+//! use chroma::ChromaHttpClient;
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! // Connect to ChromaDB
-//! let client = ChromaClient::new(chromadb::client::ChromaClientOptions::default()).await?;
+//! // Connect to Chroma
+//! let client = ChromaHttpClient::cloud()?;
 //! let collection = client.get_or_create_collection("my_agent", None, None).await?;
 //!
 //! // Create a context manager
@@ -102,7 +102,7 @@ pub const CHUNK_SIZE_LIMIT: usize = 8192;
 /// Generate the serde Deserialize/Serialize routines for a one_two_eight ID.
 ///
 /// This macro implements the necessary traits for ID types to work with serde serialization,
-/// tuple_key encoding, and ChromaDB metadata storage.
+/// tuple_key encoding, and Chroma metadata storage.
 macro_rules! generate_id_crate {
     ($name:ident, $visitor:ident) => {
         impl tuple_key::Element for $name {
